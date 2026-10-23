@@ -1,0 +1,13 @@
+{
+  "symbol": "EXCEL",
+  "underlyingId": "EXCEL",
+  "provider": "manual",
+  "dataMode": "MANUAL",
+  "nBelow": 1,
+  "nAbove": 0,
+  "rate": 0.05,
+  "timeRule": "days365",
+  "remainingDays": 2,
+  "expiryMode": "manual",
+  "expiration": "2026-10-19"
+}

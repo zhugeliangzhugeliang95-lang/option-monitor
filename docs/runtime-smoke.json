@@ -1,0 +1,9 @@
+{
+  "sseClients": 2,
+  "manualRefreshRequests": 12,
+  "observationSeconds": 22,
+  "newSnapshots": 2,
+  "distinctSlots": 2,
+  "secondWorkerRejected": true,
+  "start": "2026-10-18T23:41:54.436800+00:00"
+}

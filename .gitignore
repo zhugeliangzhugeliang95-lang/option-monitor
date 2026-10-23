@@ -1,0 +1,26 @@
+.venv/
+.env
+frontend/node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+data/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Local runtime and delivery artifacts
+.env.*
+!.env.example
+node_modules/
+.next/
+.playwright-cli/
+output/
+outputs/
+*.log
+*.sqlite*
+*.db
+*.zip
+*.bundle
+*.pem
+*.key
+.DS_Store

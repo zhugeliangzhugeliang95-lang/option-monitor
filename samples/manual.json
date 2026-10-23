@@ -1,0 +1,63 @@
+{
+  "monitorId": "REPLACE_WITH_MANUAL_MONITOR_ID",
+  "provider": "manual",
+  "valuationAt": "2026-10-19T15:00:00+00:00",
+  "underlying": {
+    "bid": 157.19,
+    "ask": 157.21,
+    "last": 157.2,
+    "bidAt": "2026-10-19T15:00:00+00:00",
+    "askAt": "2026-10-19T15:00:00+00:00",
+    "lastAt": "2026-10-19T15:00:00+00:00",
+    "source": "manual-example",
+    "feedType": "MANUAL"
+  },
+  "marketOpen": false,
+  "optionSessionOpen": false,
+  "marketReason": "MANUAL_EXCEL_EXAMPLE",
+  "historical": true,
+  "legs": [
+    {
+      "contract": {
+        "id": "EXCEL-C",
+        "underlyingId": "EXCEL",
+        "expiration": "2026-10-19",
+        "strike": "152.5",
+        "right": "C",
+        "currency": "USD",
+        "pricingAt": "2026-10-21T15:00:00+00:00"
+      },
+      "quote": {
+        "bid": 6.52,
+        "ask": 6.72,
+        "last": 6.62,
+        "bidAt": "2026-10-19T15:00:00+00:00",
+        "askAt": "2026-10-19T15:00:00+00:00",
+        "lastAt": "2026-10-19T15:00:00+00:00",
+        "source": "manual-example",
+        "feedType": "MANUAL"
+      }
+    },
+    {
+      "contract": {
+        "id": "EXCEL-P",
+        "underlyingId": "EXCEL",
+        "expiration": "2026-10-19",
+        "strike": "152.5",
+        "right": "P",
+        "currency": "USD",
+        "pricingAt": "2026-10-21T15:00:00+00:00"
+      },
+      "quote": {
+        "bid": 1.78,
+        "ask": 1.98,
+        "last": 1.88,
+        "bidAt": "2026-10-19T15:00:00+00:00",
+        "askAt": "2026-10-19T15:00:00+00:00",
+        "lastAt": "2026-10-19T15:00:00+00:00",
+        "source": "manual-example",
+        "feedType": "MANUAL"
+      }
+    }
+  ]
+}
