@@ -68,7 +68,6 @@
 - Backend: 85 tests passed (1 existing TestClient deprecation warning); covers next-snapshot fills, negative Kelly, stop gaps, premium loss cap, aggregate exposure, daily stop, stale/future quotes, missing held contracts, point-in-time invariance, persistence and append-only migration.
 - Frontend: TypeScript and production build passed; browser verified simulator navigation, running and saving a replay, mode switch and persisted account summaries.
 - Replayed 8,346 Futu snapshots from New York 2026-10-19 09:30:00 to 12:03:30. No afternoon/close coverage. Strict: 8,316 missing quote-event-time rows, 28 missing gaps and 2 duplicates; no fills. Exploratory: 3,676 eligible rows, 4,638 stale/future-last exclusions, 2 invalid books, 28 missing gaps and 2 duplicates. All eligible gaps imply zero Kelly under a 25bp stop and p=0.5 (maximum eligible absolute gap 11.268085bp). Both independent $50,000 accounts remain $50,000; neither direction variant nor cost/delay stress creates a fill. This is not a full-day profitability result.
-- Saved append-only reports in local paper_runs; no broker trade SDK or order endpoint; no forward auto-trading enabled.
 
 ### 本金更正
 
