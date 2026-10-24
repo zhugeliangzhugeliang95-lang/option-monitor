@@ -15,15 +15,25 @@ from .imports import parse_import
 
 LOCAL_ORIGINS=[f'http://127.0.0.1:{os.getenv("FRONTEND_PORT","3000")}',f'http://localhost:{os.getenv("FRONTEND_PORT","3000")}',f'http://127.0.0.1:{os.getenv("BACKEND_PORT","8000")}']
 subscribers=set()
+RESYNC={'resync':True}
+PING_SECONDS=10
+REPLAY_BATCH=200
+def publish(queue,item):
+    # A subscriber that cannot keep up loses its backlog and is told to resync instead of silently skipping events.
+    if queue.full():
+        while not queue.empty(): queue.get_nowait()
+        queue.put_nowait(RESYNC)
+    elif item is not RESYNC: queue.put_nowait(item)
+def sse(item): return f'id: {item["id"]}\ndata: {json.dumps(item)}\n\n'
+RESYNC_EVENT='event: resync\ndata: {"status":"resync"}\n\n'
+PING_EVENT='event: ping\ndata: {}\n\n'
 async def broadcast():
     with Session() as db: cursor=db.scalar(select(func.max(ResultOutbox.id))) or 0
     while True:
         with Session() as db: rows=db.scalars(select(ResultOutbox).where(ResultOutbox.id>cursor).order_by(ResultOutbox.id).limit(200)).all()
         for row in rows:
             cursor=row.id
-            for queue in list(subscribers):
-                if queue.full(): queue.get_nowait()
-                queue.put_nowait({'id':row.id,**row.payload})
+            for queue in list(subscribers): publish(queue,{'id':row.id,**row.payload})
         await asyncio.sleep(.5)
 @asynccontextmanager
 async def lifespan(app):
@@ -170,19 +180,40 @@ async def futu_expirations(symbol:str='SPY'):
     except ProviderError as e: return {'dates':[],'status':e.code}
     finally: await p.close()
 
+def parse_event_id(value):
+    try: return int(value) if value not in (None,'') else None
+    except ValueError: return None
+async def sse_events(queue,last_id,is_disconnected,ping_seconds=None):
+    ping_seconds=ping_seconds or PING_SECONDS
+    try:
+        yield 'event: ready\ndata: {"status":"connected"}\n\n'
+        sent=last_id
+        if last_id is not None:
+            with Session() as db: lo,hi=db.execute(select(func.min(ResultOutbox.id),func.max(ResultOutbox.id))).one()
+            if (lo is not None and last_id<lo-1) or (hi is not None and last_id>hi) or (lo is None and last_id>0):
+                yield RESYNC_EVENT; sent=None
+            else:
+                while True:
+                    with Session() as db: rows=db.scalars(select(ResultOutbox).where(ResultOutbox.id>sent).order_by(ResultOutbox.id).limit(REPLAY_BATCH)).all()
+                    if not rows: break
+                    for row in rows: yield sse({'id':row.id,**row.payload})
+                    sent=rows[-1].id
+        loop=asyncio.get_running_loop(); next_ping=loop.time()+ping_seconds
+        while not await is_disconnected():
+            try:
+                item=await asyncio.wait_for(queue.get(),timeout=max(0,next_ping-loop.time()))
+                if item is RESYNC: yield RESYNC_EVENT; sent=None
+                elif sent is None or item['id']>sent: yield sse(item); sent=item['id']
+            except TimeoutError: pass
+            if loop.time()>=next_ping: yield PING_EVENT; next_ping=loop.time()+ping_seconds
+    finally: subscribers.discard(queue)
 @app.get('/api/stream')
-async def stream(request:Request):
+async def stream(request:Request,lastEventId:str|None=None):
+    # Last-Event-ID header (browser reconnect) wins over the ?lastEventId= query parameter.
+    last=parse_event_id(request.headers.get('last-event-id'))
+    if last is None: last=parse_event_id(lastEventId)
     queue=asyncio.Queue(maxsize=100); subscribers.add(queue)
-    async def events():
-        try:
-            yield 'event: ready\ndata: {"status":"connected"}\n\n'
-            while not await request.is_disconnected():
-                try:
-                    item=await asyncio.wait_for(queue.get(),timeout=5)
-                    yield f'id: {item["id"]}\ndata: {json.dumps(item)}\n\n'
-                except TimeoutError: yield ': heartbeat\n\n'
-        finally: subscribers.discard(queue)
-    return StreamingResponse(events(),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+    return StreamingResponse(sse_events(queue,last,request.is_disconnected),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
 @app.post('/api/research/frozen-observations')
 def freeze(body:dict):
     with Session() as db:

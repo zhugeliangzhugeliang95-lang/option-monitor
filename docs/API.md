@@ -2,6 +2,8 @@
 
 本地FastAPI OpenAPI：`/docs` 和 `/openapi.json`。前端同源`/api`反代到Python。数据时间字段必须带时区；持久报价时间规范化为UTC。错误详情不包括供应商原始响应、密钥或认证请求头。
 
+- `GET /api/stream`: SSE; each event has `id:` = outbox id. Reconnect with `Last-Event-ID` header (wins) or `?lastEventId=` to replay missed events; `event: resync` means refetch state (id pruned/unknown or client too slow); `event: ping` every 10s.
+
 ## 研究API
 
 | 方法 / 路径 | 输入或作用 |
