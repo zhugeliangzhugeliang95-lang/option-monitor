@@ -93,3 +93,19 @@ def test_history_and_latest_summary(cfg,sample):
     lf=client.get('/api/results/latest').json()[m.id]; ls=client.get('/api/results/latest?summary=1').json()[m.id]
     assert ls['id']==full[-1]['id'] and ls['oldConfiguration'] is False and lf['oldConfiguration'] is False
     assert 'rows' not in ls['modes']['MID'] and 'rows' in lf['modes']['MID'] and ls['statistics']==lf['statistics']
+
+def test_export_streams_same_structure(cfg,sample,monkeypatch):
+    import app.api as api, json
+    monkeypatch.setattr(api,'EXPORT_BATCH',2)
+    with Session() as db:
+        m=create_monitor(db,cfg)
+        for i in range(5):
+            s=sample(spot=601+i*.01); s.monitorId=m.id; save_snapshot(db,s)
+        tables=[RunConfig,RawSnapshot,AggregateResult,MinuteBlock,StatisticalResult,FrozenObservation,ObservationOutcome,ProviderStatus]
+        expected={t.__tablename__:[{c.name:getattr(r,c.name) for c in t.__table__.columns} for r in db.scalars(select(t).where(t.monitor_id==m.id).order_by(t.id))] for t in tables}
+    expected=json.loads(json.dumps({'run_configs':expected['run_configs'],'raw_snapshots':expected['raw_snapshots'],'pair_results':[api.pair_row(r) for r in expected['aggregate_results']],**{k:v for k,v in expected.items() if k not in ('run_configs','raw_snapshots')}}))
+    r=client.get(f'/api/exports/{m.id}')
+    assert r.headers['content-type'].startswith('application/json') and 'attachment' in r.headers['content-disposition']
+    got=r.json(); assert list(got)==list(expected) and got==expected and len(got['raw_snapshots'])==5
+    assert client.get('/api/exports/nope').status_code==404
+    assert client.get(f'/api/exports/{m.id}?format=csv').text.count('\n')==1+5*5

@@ -201,20 +201,42 @@ def pair_row(agg):
     # pair_results is no longer written; derive the same record shape from the aggregate payload.
     return {'id':agg['id'],'monitor_id':agg['monitor_id'],'config_id':agg['config_id'],'created_at':agg['created_at'],
             'payload':{k:v['rows'] for k,v in agg['payload']['modes'].items()},'snapshot_id':agg['snapshot_id']}
+EXPORT_TABLES=[RunConfig,RawSnapshot,'pair_results',AggregateResult,MinuteBlock,StatisticalResult,FrozenObservation,ObservationOutcome,ProviderStatus]
+EXPORT_BATCH=500
+def export_rows(db,table,mid,batch=EXPORT_BATCH):
+    # Keyset pagination by primary key keeps memory bounded to one batch.
+    cols=table.__table__.columns; last=None
+    while True:
+        q=select(table).where(table.monitor_id==mid)
+        if last is not None: q=q.where(table.id>last)
+        rows=db.scalars(q.order_by(table.id).limit(batch)).all()
+        if not rows: return
+        for r in rows: yield {c.name:getattr(r,c.name) for c in cols}
+        last=rows[-1].id; db.expunge_all()
+def export_json(mid):
+    with Session() as db:
+        yield '{'
+        for i,t in enumerate(EXPORT_TABLES):
+            name=t if isinstance(t,str) else t.__tablename__
+            rows=(pair_row(r) for r in export_rows(db,AggregateResult,mid)) if t=='pair_results' else export_rows(db,t,mid)
+            yield ('' if i==0 else ', ')+json.dumps(name)+': ['
+            buf=[]
+            for j,r in enumerate(rows):
+                buf.append(('' if j==0 else ', ')+json.dumps(r,ensure_ascii=False))
+                if len(buf)>=EXPORT_BATCH: yield ''.join(buf); buf=[]
+            yield ''.join(buf)+']'
+        yield '}'
 @app.get('/api/exports/{mid}')
 def export(mid:str,format:str='json'):
-    with Session() as db:
-        monitor(db,mid)
-        tables=[RunConfig,RawSnapshot,AggregateResult,MinuteBlock,StatisticalResult,FrozenObservation,ObservationOutcome,ProviderStatus]
-        data={t.__tablename__:[{c.name:getattr(r,c.name) for c in t.__table__.columns} for r in db.scalars(select(t).where(t.monitor_id==mid))] for t in tables}
-        data={'run_configs':data['run_configs'],'raw_snapshots':data['raw_snapshots'],'pair_results':[pair_row(r) for r in data['aggregate_results']],**{k:v for k,v in data.items() if k not in ('run_configs','raw_snapshots')}}
-        if format=='csv':
+    with Session() as db: monitor(db,mid)
+    if format=='csv':
+        with Session() as db:
             buff=io.StringIO(); writer=csv.writer(buff); writer.writerow(['snapshotId','configHash','valuationAt','feedType','mode','callBasis','putBasis','stockBasis','rawMean','validatedMean','belowMean','aboveMean','validCount','requestedCount','strictEligible'])
-            for r in data['aggregate_results']:
+            for r in export_rows(db,AggregateResult,mid):
                 p=r['payload']
                 for mode,a in p['modes'].items(): writer.writerow([p['snapshotId'],p['configHash'],p['valuationAt'],p['feedType'],mode]+[a[k] for k in ('callBasis','putBasis','stockBasis','rawMean','validatedMean','belowMean','aboveMean','validCount','requestedCount','strictEligible')])
             return Response(buff.getvalue(),media_type='text/csv',headers={'Content-Disposition':f'attachment; filename="{mid}.csv"'})
-        return Response(json.dumps(data,ensure_ascii=False,indent=2),media_type='application/json',headers={'Content-Disposition':f'attachment; filename="{mid}.json"'})
+    return StreamingResponse((c.encode() for c in export_json(mid)),media_type='application/json',headers={'Content-Disposition':f'attachment; filename="{mid}.json"'})
 
 @app.get('/api/research/frozen-observations')
 def frozen_list(monitorId:str):
