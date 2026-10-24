@@ -1,4 +1,4 @@
-import asyncio, fcntl, os, time
+import asyncio, fcntl, logging, os, time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from sqlalchemy import select
@@ -7,6 +7,8 @@ from .models import Config, Snapshot, Leg, utcnow
 from .engine import selected_strikes
 from .providers import provider_for, ProviderError, regular_session
 from .service import save_snapshot, persist_statistics
+from . import retention
+log=logging.getLogger('app.worker')
 
 class Worker:
     def __init__(self):
@@ -98,10 +100,15 @@ class Worker:
                     await asyncio.gather(*(self.collect(mid,rc,pre_error=error) for mid,rc in items))
         await asyncio.gather(*(group(name,[(m,r) for m,r in due if r.payload['provider']==name]) for name in self.providers if any(r.payload['provider']==name for _,r in due)))
     async def run(self):
-        hb=asyncio.create_task(self.heartbeat()); minute=None
+        hb=asyncio.create_task(self.heartbeat()); minute=None; retention_day=None; zone=retention.exchange_zone()
         try:
             while True:
                 await self.cycle()
+                if retention.due(utcnow(),retention_day,zone):
+                    # Between collection cycles, once per exchange day at 08:00 America/New_York.
+                    retention_day=utcnow().astimezone(zone).date()
+                    try: await asyncio.to_thread(retention.run_on_path,DB_PATH)
+                    except Exception: log.exception('retention failed')
                 now=utcnow(); key=now.replace(second=0,microsecond=0)
                 if key!=minute:
                     with Session() as db: persist_statistics(db,now)
@@ -112,6 +119,7 @@ class Worker:
             for p in self.providers.values(): await p.close()
 
 def main():
+    logging.basicConfig(level=os.getenv('LOG_LEVEL','INFO'),format='%(asctime)s %(levelname)s %(name)s %(message)s')
     lock=open(str(DB_PATH)+'.worker.lock','w')
     try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError: raise SystemExit('A worker already owns this database')
