@@ -9,21 +9,31 @@ from sqlalchemy import select, func
 from .db import *
 from .models import Config, Snapshot, utcnow
 from .engine import compute, BASES
-from .service import create_monitor, revise, save_snapshot, statistics_for
+from .service import create_monitor, revise, save_snapshot, statistics_for, summary_columns, summary_row
 from .providers import provider_for, ProviderError
 from .imports import parse_import
 
 LOCAL_ORIGINS=[f'http://127.0.0.1:{os.getenv("FRONTEND_PORT","3000")}',f'http://localhost:{os.getenv("FRONTEND_PORT","3000")}',f'http://127.0.0.1:{os.getenv("BACKEND_PORT","8000")}']
 subscribers=set()
+RESYNC={'resync':True}
+PING_SECONDS=10
+REPLAY_BATCH=200
+def publish(queue,item):
+    # A subscriber that cannot keep up loses its backlog and is told to resync instead of silently skipping events.
+    if queue.full():
+        while not queue.empty(): queue.get_nowait()
+        queue.put_nowait(RESYNC)
+    elif item is not RESYNC: queue.put_nowait(item)
+def sse(item): return f'id: {item["id"]}\ndata: {json.dumps(item)}\n\n'
+RESYNC_EVENT='event: resync\ndata: {"status":"resync"}\n\n'
+PING_EVENT='event: ping\ndata: {}\n\n'
 async def broadcast():
     with Session() as db: cursor=db.scalar(select(func.max(ResultOutbox.id))) or 0
     while True:
         with Session() as db: rows=db.scalars(select(ResultOutbox).where(ResultOutbox.id>cursor).order_by(ResultOutbox.id).limit(200)).all()
         for row in rows:
             cursor=row.id
-            for queue in list(subscribers):
-                if queue.full(): queue.get_nowait()
-                queue.put_nowait({'id':row.id,**row.payload})
+            for queue in list(subscribers): publish(queue,{'id':row.id,**row.payload})
         await asyncio.sleep(.5)
 @asynccontextmanager
 async def lifespan(app):
@@ -94,22 +104,35 @@ def preview(mid:str,body:dict):
         cfg=Config.model_validate({**rc.payload,**changes}); result=compute(cfg,Snapshot.model_validate(raw.payload))
         return {**result,'preview':True,'historicalRecalculation':True,'snapshotId':raw.id,'configHash':rc.hash}
 @app.get('/api/results/latest')
-def latest():
+def latest(summary:bool=False):
     with Session() as db:
         out={}
         for m in db.scalars(select(Monitor).where(Monitor.active==True)):
-            row=db.scalar(select(AggregateResult).where(AggregateResult.monitor_id==m.id).order_by(AggregateResult.id.desc()).limit(1))
-            if row:
+            if summary:
+                r=db.execute(select(*summary_columns()).where(AggregateResult.monitor_id==m.id).order_by(AggregateResult.id.desc()).limit(1)).first()
+                payload,config_id=(summary_row(r),None) if r else (None,None)
+                if payload: config_id=payload['configId']
+            else:
+                row=db.scalar(select(AggregateResult).where(AggregateResult.monitor_id==m.id).order_by(AggregateResult.id.desc()).limit(1))
+                payload,config_id=(row.payload,row.config_id) if row else (None,None)
+            if payload:
                 st=db.scalar(select(StatisticalResult).where(StatisticalResult.monitor_id==m.id,StatisticalResult.config_id==m.config_id).order_by(StatisticalResult.id.desc()).limit(1))
-                out[m.id]={**row.payload,'oldConfiguration':row.config_id!=m.config_id,'statistics':st.payload if st else None}
+                out[m.id]={**payload,'oldConfiguration':config_id!=m.config_id,'statistics':st.payload if st else None}
         return out
 @app.get('/api/monitors/{mid}/history')
-def history(mid:str,limit:int=200,before:int|None=None):
+def history(mid:str,limit:int=200,before:int|None=None,after:int|None=None,summary:bool=False):
     with Session() as db:
-        monitor(db,mid); query=select(AggregateResult).where(AggregateResult.monitor_id==mid)
+        monitor(db,mid); limit=min(max(limit,1),500)
+        query=select(*summary_columns()) if summary else select(AggregateResult)
+        query=query.where(AggregateResult.monitor_id==mid)
         if before: query=query.where(AggregateResult.id<before)
-        rows=db.scalars(query.order_by(AggregateResult.id.desc()).limit(min(max(limit,1),500))).all()
-        return [{'id':r.id,**r.payload} for r in reversed(rows)]
+        if after is not None:
+            # Incremental: oldest records newer than `after`, ascending.
+            query=query.where(AggregateResult.id>after).order_by(AggregateResult.id.asc()).limit(limit); ordered=lambda rows: rows
+        else:
+            query=query.order_by(AggregateResult.id.desc()).limit(limit); ordered=lambda rows: list(reversed(rows))
+        if summary: return [summary_row(r) for r in ordered(db.execute(query).all())]
+        return [{'id':r.id,**r.payload} for r in ordered(db.scalars(query).all())]
 @app.get('/api/snapshots/{sid}')
 def raw_snapshot(sid:int):
     with Session() as db:
@@ -157,19 +180,40 @@ async def futu_expirations(symbol:str='SPY'):
     except ProviderError as e: return {'dates':[],'status':e.code}
     finally: await p.close()
 
+def parse_event_id(value):
+    try: return int(value) if value not in (None,'') else None
+    except ValueError: return None
+async def sse_events(queue,last_id,is_disconnected,ping_seconds=None):
+    ping_seconds=ping_seconds or PING_SECONDS
+    try:
+        yield 'event: ready\ndata: {"status":"connected"}\n\n'
+        sent=last_id
+        if last_id is not None:
+            with Session() as db: lo,hi=db.execute(select(func.min(ResultOutbox.id),func.max(ResultOutbox.id))).one()
+            if (lo is not None and last_id<lo-1) or (hi is not None and last_id>hi) or (lo is None and last_id>0):
+                yield RESYNC_EVENT; sent=None
+            else:
+                while True:
+                    with Session() as db: rows=db.scalars(select(ResultOutbox).where(ResultOutbox.id>sent).order_by(ResultOutbox.id).limit(REPLAY_BATCH)).all()
+                    if not rows: break
+                    for row in rows: yield sse({'id':row.id,**row.payload})
+                    sent=rows[-1].id
+        loop=asyncio.get_running_loop(); next_ping=loop.time()+ping_seconds
+        while not await is_disconnected():
+            try:
+                item=await asyncio.wait_for(queue.get(),timeout=max(0,next_ping-loop.time()))
+                if item is RESYNC: yield RESYNC_EVENT; sent=None
+                elif sent is None or item['id']>sent: yield sse(item); sent=item['id']
+            except TimeoutError: pass
+            if loop.time()>=next_ping: yield PING_EVENT; next_ping=loop.time()+ping_seconds
+    finally: subscribers.discard(queue)
 @app.get('/api/stream')
-async def stream(request:Request):
+async def stream(request:Request,lastEventId:str|None=None):
+    # Last-Event-ID header (browser reconnect) wins over the ?lastEventId= query parameter.
+    last=parse_event_id(request.headers.get('last-event-id'))
+    if last is None: last=parse_event_id(lastEventId)
     queue=asyncio.Queue(maxsize=100); subscribers.add(queue)
-    async def events():
-        try:
-            yield 'event: ready\ndata: {"status":"connected"}\n\n'
-            while not await request.is_disconnected():
-                try:
-                    item=await asyncio.wait_for(queue.get(),timeout=5)
-                    yield f'id: {item["id"]}\ndata: {json.dumps(item)}\n\n'
-                except TimeoutError: yield ': heartbeat\n\n'
-        finally: subscribers.discard(queue)
-    return StreamingResponse(events(),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+    return StreamingResponse(sse_events(queue,last,request.is_disconnected),media_type='text/event-stream',headers={'Cache-Control':'no-cache, no-transform','X-Accel-Buffering':'no'})
 @app.post('/api/research/frozen-observations')
 def freeze(body:dict):
     with Session() as db:
@@ -184,19 +228,46 @@ def outcome(fid:int,body:dict):
         f=db.get(FrozenObservation,fid)
         if not f: raise HTTPException(404,'观察不存在')
         r=record(ObservationOutcome,f.monitor_id,f.config_id,{'frozenId':fid,'outcome':body}); db.add(r); db.commit(); return {'id':r.id}
+def pair_row(agg):
+    # pair_results is no longer written; derive the same record shape from the aggregate payload.
+    return {'id':agg['id'],'monitor_id':agg['monitor_id'],'config_id':agg['config_id'],'created_at':agg['created_at'],
+            'payload':{k:v['rows'] for k,v in agg['payload']['modes'].items()},'snapshot_id':agg['snapshot_id']}
+EXPORT_TABLES=[RunConfig,RawSnapshot,'pair_results',AggregateResult,MinuteBlock,StatisticalResult,FrozenObservation,ObservationOutcome,ProviderStatus]
+EXPORT_BATCH=500
+def export_rows(db,table,mid,batch=EXPORT_BATCH):
+    # Keyset pagination by primary key keeps memory bounded to one batch.
+    cols=table.__table__.columns; last=None
+    while True:
+        q=select(table).where(table.monitor_id==mid)
+        if last is not None: q=q.where(table.id>last)
+        rows=db.scalars(q.order_by(table.id).limit(batch)).all()
+        if not rows: return
+        for r in rows: yield {c.name:getattr(r,c.name) for c in cols}
+        last=rows[-1].id; db.expunge_all()
+def export_json(mid):
+    with Session() as db:
+        yield '{'
+        for i,t in enumerate(EXPORT_TABLES):
+            name=t if isinstance(t,str) else t.__tablename__
+            rows=(pair_row(r) for r in export_rows(db,AggregateResult,mid)) if t=='pair_results' else export_rows(db,t,mid)
+            yield ('' if i==0 else ', ')+json.dumps(name)+': ['
+            buf=[]
+            for j,r in enumerate(rows):
+                buf.append(('' if j==0 else ', ')+json.dumps(r,ensure_ascii=False))
+                if len(buf)>=EXPORT_BATCH: yield ''.join(buf); buf=[]
+            yield ''.join(buf)+']'
+        yield '}'
 @app.get('/api/exports/{mid}')
 def export(mid:str,format:str='json'):
-    with Session() as db:
-        monitor(db,mid)
-        tables=[RunConfig,RawSnapshot,PairResult,AggregateResult,MinuteBlock,StatisticalResult,FrozenObservation,ObservationOutcome,ProviderStatus]
-        data={t.__tablename__:[{c.name:getattr(r,c.name) for c in t.__table__.columns} for r in db.scalars(select(t).where(t.monitor_id==mid))] for t in tables}
-        if format=='csv':
+    with Session() as db: monitor(db,mid)
+    if format=='csv':
+        with Session() as db:
             buff=io.StringIO(); writer=csv.writer(buff); writer.writerow(['snapshotId','configHash','valuationAt','feedType','mode','callBasis','putBasis','stockBasis','rawMean','validatedMean','belowMean','aboveMean','validCount','requestedCount','strictEligible'])
-            for r in data['aggregate_results']:
+            for r in export_rows(db,AggregateResult,mid):
                 p=r['payload']
                 for mode,a in p['modes'].items(): writer.writerow([p['snapshotId'],p['configHash'],p['valuationAt'],p['feedType'],mode]+[a[k] for k in ('callBasis','putBasis','stockBasis','rawMean','validatedMean','belowMean','aboveMean','validCount','requestedCount','strictEligible')])
             return Response(buff.getvalue(),media_type='text/csv',headers={'Content-Disposition':f'attachment; filename="{mid}.csv"'})
-        return Response(json.dumps(data,ensure_ascii=False,indent=2),media_type='application/json',headers={'Content-Disposition':f'attachment; filename="{mid}.json"'})
+    return StreamingResponse((c.encode() for c in export_json(mid)),media_type='application/json',headers={'Content-Disposition':f'attachment; filename="{mid}.json"'})
 
 @app.get('/api/research/frozen-observations')
 def frozen_list(monitorId:str):
