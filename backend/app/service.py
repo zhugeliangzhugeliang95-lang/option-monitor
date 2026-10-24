@@ -1,6 +1,6 @@
-import uuid
+import json, uuid
 from datetime import datetime, timedelta
-from sqlalchemy import select
+from sqlalchemy import select, func
 from .db import *
 from .models import Config, Snapshot
 from .engine import compute, BASES
@@ -43,22 +43,32 @@ def save_snapshot(db,s,config_id=None):
         if duplicate: a['strictEligible']=False; a['dBps']=None
     raw=record(RawSnapshot,m.id,rc.id,s.model_dump(mode='json'),fingerprint=fp); db.add(raw); db.flush()
     result['snapshotId']=raw.id
-    db.add(record(PairResult,m.id,rc.id,{k:v['rows'] for k,v in result['modes'].items()},snapshot_id=raw.id))
+    # Pair rows live in the aggregate payload (modes[*].rows); pair_results is legacy/read-only now.
     db.add(record(AggregateResult,m.id,rc.id,result,snapshot_id=raw.id))
     db.add(ResultOutbox(payload={'type':'result','monitorId':m.id,'snapshotId':raw.id},created_at=nowstr()))
     db.commit(); return result
 
+STREAM_KEYS=('tradingDay','expiration','feedType','source','historical')
+STAT_KEYS=('valuationAt','strictEligible','dBps')+STREAM_KEYS
+def stat_query(mid,cid,mode,limit=3000):
+    # Only the fields statistics need, via SQLite json_extract (avoids decoding ~55KB payloads per row).
+    j=lambda path: func.json_extract(AggregateResult.payload,path)
+    m=mode.replace('"','')
+    cols=[j('$.valuationAt'),j(f'$.modes."{m}".strictEligible'),j(f'$.modes."{m}".dBps')]+[j(f'$.{k}') for k in STREAM_KEYS]
+    return select(*cols).where(AggregateResult.monitor_id==mid,AggregateResult.config_id==cid).order_by(AggregateResult.id.desc()).limit(limit)
+
 def statistics_for(db,m,asof,mode=None):
     rc=config_for(db,m); cfg=Config.model_validate(rc.payload)
     if mode: cfg=cfg.model_copy(update={'optionPricePreset':mode})
-    rows=db.scalars(select(AggregateResult).where(AggregateResult.monitor_id==m.id,AggregateResult.config_id==rc.id).order_by(AggregateResult.id.desc()).limit(3000)).all()
+    rows=[dict(zip(STAT_KEYS,r)) for r in db.execute(stat_query(m.id,rc.id,cfg.optionPricePreset)).all()]
     # One source/feed, expiry, trade day and historical designation per stream.
-    latest=rows[0].payload if rows else None
+    latest=rows[0] if rows else None
+    if latest: latest['historical']=bool(latest['historical'])
     observations=[]
-    for row in reversed(rows):
-        r=row.payload; a=r['modes'][cfg.optionPricePreset]
-        if latest and any(r.get(k)!=latest.get(k) for k in ('tradingDay','expiration','feedType','source','historical')): continue
-        observations.append({'at':r['valuationAt'],'eligible':a['strictEligible'],'dBps':a['dBps']})
+    for r in reversed(rows):
+        if r['historical'] is not None: r['historical']=bool(r['historical'])
+        if latest and any(r.get(k)!=latest.get(k) for k in STREAM_KEYS): continue
+        observations.append({'at':r['valuationAt'],'eligible':bool(r['strictEligible']),'dBps':r['dBps']})
     stat=analyze(observations,asof,cfg)
     stat.update(configId=rc.id,configHash=rc.hash,configVersion=rc.version,monitorId=m.id,mode=cfg.optionPricePreset,
                 feedType=latest['feedType'] if latest else None,historical=latest['historical'] if latest else False,
@@ -78,3 +88,21 @@ def persist_statistics(db,asof):
         # Closed block snapshots are append-only audit revisions, never overwritten.
         db.add(record(MinuteBlock,m.id,m.config_id,{'statsAsOf':asof.isoformat(),'blocks':s['blocks']}))
     db.add(ResultOutbox(payload={'type':'statistics','statsAsOf':asof.isoformat()},created_at=nowstr())); db.commit()
+
+SUMMARY_SCALARS=('snapshotId','valuationAt','configId','configVersion','feedType','historical','duplicate','status','stockReference','composition')
+SUMMARY_MODE_KEYS=('rawMean','validatedMean','rawGapBps')
+def summary_columns():
+    """Compact history record (~1% of the full payload) built from json_extract columns; values come from SQLite as exact Python scalars."""
+    j=lambda path: func.json_extract(AggregateResult.payload,path)
+    cols=[AggregateResult.id]+[j(f'$.{k}') for k in SUMMARY_SCALARS]+[func.json_type(AggregateResult.payload,'$.stockReference')]
+    cols+=[j(f'$.modes."{m}".{k}') for m in BASES for k in SUMMARY_MODE_KEYS]+[func.json_type(AggregateResult.payload,f'$.modes."{m}"') for m in BASES]
+    return cols
+def summary_row(row):
+    row=list(row); out={'id':row[0],**dict(zip(SUMMARY_SCALARS,row[1:11]))}; rest=row[12:]
+    for k in ('historical','duplicate'):
+        if out[k] is not None: out[k]=bool(out[k])
+    if row[11] in ('object','array'): out['stockReference']=json.loads(out['stockReference'])
+    out['composition']=json.loads(out['composition']) if out['composition'] is not None else None
+    n=len(SUMMARY_MODE_KEYS); present=rest[len(BASES)*n:]
+    out['modes']={m:dict(zip(SUMMARY_MODE_KEYS,rest[i*n:(i+1)*n])) for i,m in enumerate(BASES) if present[i]=='object'}
+    return out

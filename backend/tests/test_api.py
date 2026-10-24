@@ -64,3 +64,48 @@ def test_refresh_manual_no_acquisition(cfg,sample):
 def test_origin_rejected():
     r=client.post('/api/monitors',json={},headers={'origin':'https://untrusted.example'})
     assert r.status_code==403
+
+def test_pair_results_not_written_but_exported(cfg,sample):
+    with Session() as db:
+        m=create_monitor(db,cfg); s=sample(); s.monitorId=m.id; r=save_snapshot(db,s)
+        assert db.scalar(select(func.count()).select_from(PairResult).where(PairResult.monitor_id==m.id))==0
+    export=client.get(f'/api/exports/{m.id}').json()
+    assert list(export)[:4]==['run_configs','raw_snapshots','pair_results','aggregate_results']
+    assert export['pair_results'][0]['payload']=={k:v['rows'] for k,v in r['modes'].items()}
+    assert export['pair_results'][0]['snapshot_id']==r['snapshotId']
+
+def test_history_and_latest_summary(cfg,sample):
+    from app.service import SUMMARY_SCALARS
+    with Session() as db:
+        m=create_monitor(db,cfg); ids=[]
+        for i in range(3):
+            s=sample(spot=601+i*.01); s.monitorId=m.id; save_snapshot(db,s)
+    full=client.get(f'/api/monitors/{m.id}/history').json()
+    summ=client.get(f'/api/monitors/{m.id}/history?summary=1').json()
+    assert [r['id'] for r in full]==[r['id'] for r in summ] and len(summ)==3
+    for f,s in zip(full,summ):
+        assert set(s)=={'id','modes',*SUMMARY_SCALARS}
+        for k in SUMMARY_SCALARS: assert s[k]==f[k] and type(s[k])==type(f[k]), k
+        assert s['modes']=={mode:{k:a[k] for k in ('rawMean','validatedMean','rawGapBps')} for mode,a in f['modes'].items()}
+    after=client.get(f'/api/monitors/{m.id}/history?summary=1&after={full[0]["id"]}&limit=1').json()
+    assert [r['id'] for r in after]==[full[1]['id']]
+    assert [r['id'] for r in client.get(f'/api/monitors/{m.id}/history?after={full[0]["id"]}').json()]==[full[1]['id'],full[2]['id']]
+    lf=client.get('/api/results/latest').json()[m.id]; ls=client.get('/api/results/latest?summary=1').json()[m.id]
+    assert ls['id']==full[-1]['id'] and ls['oldConfiguration'] is False and lf['oldConfiguration'] is False
+    assert 'rows' not in ls['modes']['MID'] and 'rows' in lf['modes']['MID'] and ls['statistics']==lf['statistics']
+
+def test_export_streams_same_structure(cfg,sample,monkeypatch):
+    import app.api as api, json
+    monkeypatch.setattr(api,'EXPORT_BATCH',2)
+    with Session() as db:
+        m=create_monitor(db,cfg)
+        for i in range(5):
+            s=sample(spot=601+i*.01); s.monitorId=m.id; save_snapshot(db,s)
+        tables=[RunConfig,RawSnapshot,AggregateResult,MinuteBlock,StatisticalResult,FrozenObservation,ObservationOutcome,ProviderStatus]
+        expected={t.__tablename__:[{c.name:getattr(r,c.name) for c in t.__table__.columns} for r in db.scalars(select(t).where(t.monitor_id==m.id).order_by(t.id))] for t in tables}
+    expected=json.loads(json.dumps({'run_configs':expected['run_configs'],'raw_snapshots':expected['raw_snapshots'],'pair_results':[api.pair_row(r) for r in expected['aggregate_results']],**{k:v for k,v in expected.items() if k not in ('run_configs','raw_snapshots')}}))
+    r=client.get(f'/api/exports/{m.id}')
+    assert r.headers['content-type'].startswith('application/json') and 'attachment' in r.headers['content-disposition']
+    got=r.json(); assert list(got)==list(expected) and got==expected and len(got['raw_snapshots'])==5
+    assert client.get('/api/exports/nope').status_code==404
+    assert client.get(f'/api/exports/{m.id}?format=csv').text.count('\n')==1+5*5

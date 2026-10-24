@@ -1,7 +1,7 @@
 import hashlib, json, os
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import create_engine, event, String, Integer, Text, JSON, Boolean, UniqueConstraint
+from sqlalchemy import Index, create_engine, event, String, Integer, Text, JSON, Boolean, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 ROOT=Path(__file__).resolve().parents[2]
 DB_PATH=Path(os.getenv('DATABASE_PATH',str(ROOT/'data/monitor.sqlite3')))
@@ -40,6 +40,7 @@ class PairResult(Record,Base):
     snapshot_id:Mapped[int]=mapped_column(Integer,index=True)
 class AggregateResult(Record,Base):
     __tablename__='aggregate_results'
+    __table_args__=(Index('ix_aggregate_results_monitor_config_id','monitor_id','config_id','id'),)
     snapshot_id:Mapped[int]=mapped_column(Integer,index=True)
 class MinuteBlock(Record,Base): __tablename__='minute_blocks'
 class StatisticalResult(Record,Base): __tablename__='statistical_results'
