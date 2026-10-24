@@ -59,9 +59,3 @@ class ResultOutbox(Base):
 def digest(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 def nowstr(): return datetime.now(timezone.utc).isoformat()
 def record(cls,monitor,config,payload,**kw): return cls(monitor_id=monitor,config_id=config,created_at=nowstr(),payload=payload,**kw)
-
-class PaperRun(Base):
-    __tablename__='paper_runs'
-    id:Mapped[str]=mapped_column(String,primary_key=True)
-    created_at:Mapped[str]=mapped_column(String,index=True)
-    payload:Mapped[dict]=mapped_column(JSON)
