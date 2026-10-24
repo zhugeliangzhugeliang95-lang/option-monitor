@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timedelta
-from sqlalchemy import select
+from sqlalchemy import select, func
 from .db import *
 from .models import Config, Snapshot
 from .engine import compute, BASES
@@ -48,17 +48,27 @@ def save_snapshot(db,s,config_id=None):
     db.add(ResultOutbox(payload={'type':'result','monitorId':m.id,'snapshotId':raw.id},created_at=nowstr()))
     db.commit(); return result
 
+STREAM_KEYS=('tradingDay','expiration','feedType','source','historical')
+STAT_KEYS=('valuationAt','strictEligible','dBps')+STREAM_KEYS
+def stat_query(mid,cid,mode,limit=3000):
+    # Only the fields statistics need, via SQLite json_extract (avoids decoding ~55KB payloads per row).
+    j=lambda path: func.json_extract(AggregateResult.payload,path)
+    m=mode.replace('"','')
+    cols=[j('$.valuationAt'),j(f'$.modes."{m}".strictEligible'),j(f'$.modes."{m}".dBps')]+[j(f'$.{k}') for k in STREAM_KEYS]
+    return select(*cols).where(AggregateResult.monitor_id==mid,AggregateResult.config_id==cid).order_by(AggregateResult.id.desc()).limit(limit)
+
 def statistics_for(db,m,asof,mode=None):
     rc=config_for(db,m); cfg=Config.model_validate(rc.payload)
     if mode: cfg=cfg.model_copy(update={'optionPricePreset':mode})
-    rows=db.scalars(select(AggregateResult).where(AggregateResult.monitor_id==m.id,AggregateResult.config_id==rc.id).order_by(AggregateResult.id.desc()).limit(3000)).all()
+    rows=[dict(zip(STAT_KEYS,r)) for r in db.execute(stat_query(m.id,rc.id,cfg.optionPricePreset)).all()]
     # One source/feed, expiry, trade day and historical designation per stream.
-    latest=rows[0].payload if rows else None
+    latest=rows[0] if rows else None
+    if latest: latest['historical']=bool(latest['historical'])
     observations=[]
-    for row in reversed(rows):
-        r=row.payload; a=r['modes'][cfg.optionPricePreset]
-        if latest and any(r.get(k)!=latest.get(k) for k in ('tradingDay','expiration','feedType','source','historical')): continue
-        observations.append({'at':r['valuationAt'],'eligible':a['strictEligible'],'dBps':a['dBps']})
+    for r in reversed(rows):
+        if r['historical'] is not None: r['historical']=bool(r['historical'])
+        if latest and any(r.get(k)!=latest.get(k) for k in STREAM_KEYS): continue
+        observations.append({'at':r['valuationAt'],'eligible':bool(r['strictEligible']),'dBps':r['dBps']})
     stat=analyze(observations,asof,cfg)
     stat.update(configId=rc.id,configHash=rc.hash,configVersion=rc.version,monitorId=m.id,mode=cfg.optionPricePreset,
                 feedType=latest['feedType'] if latest else None,historical=latest['historical'] if latest else False,
