@@ -184,12 +184,17 @@ def outcome(fid:int,body:dict):
         f=db.get(FrozenObservation,fid)
         if not f: raise HTTPException(404,'观察不存在')
         r=record(ObservationOutcome,f.monitor_id,f.config_id,{'frozenId':fid,'outcome':body}); db.add(r); db.commit(); return {'id':r.id}
+def pair_row(agg):
+    # pair_results is no longer written; derive the same record shape from the aggregate payload.
+    return {'id':agg['id'],'monitor_id':agg['monitor_id'],'config_id':agg['config_id'],'created_at':agg['created_at'],
+            'payload':{k:v['rows'] for k,v in agg['payload']['modes'].items()},'snapshot_id':agg['snapshot_id']}
 @app.get('/api/exports/{mid}')
 def export(mid:str,format:str='json'):
     with Session() as db:
         monitor(db,mid)
-        tables=[RunConfig,RawSnapshot,PairResult,AggregateResult,MinuteBlock,StatisticalResult,FrozenObservation,ObservationOutcome,ProviderStatus]
+        tables=[RunConfig,RawSnapshot,AggregateResult,MinuteBlock,StatisticalResult,FrozenObservation,ObservationOutcome,ProviderStatus]
         data={t.__tablename__:[{c.name:getattr(r,c.name) for c in t.__table__.columns} for r in db.scalars(select(t).where(t.monitor_id==mid))] for t in tables}
+        data={'run_configs':data['run_configs'],'raw_snapshots':data['raw_snapshots'],'pair_results':[pair_row(r) for r in data['aggregate_results']],**{k:v for k,v in data.items() if k not in ('run_configs','raw_snapshots')}}
         if format=='csv':
             buff=io.StringIO(); writer=csv.writer(buff); writer.writerow(['snapshotId','configHash','valuationAt','feedType','mode','callBasis','putBasis','stockBasis','rawMean','validatedMean','belowMean','aboveMean','validCount','requestedCount','strictEligible'])
             for r in data['aggregate_results']:

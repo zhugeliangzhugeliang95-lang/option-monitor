@@ -43,7 +43,7 @@ def save_snapshot(db,s,config_id=None):
         if duplicate: a['strictEligible']=False; a['dBps']=None
     raw=record(RawSnapshot,m.id,rc.id,s.model_dump(mode='json'),fingerprint=fp); db.add(raw); db.flush()
     result['snapshotId']=raw.id
-    db.add(record(PairResult,m.id,rc.id,{k:v['rows'] for k,v in result['modes'].items()},snapshot_id=raw.id))
+    # Pair rows live in the aggregate payload (modes[*].rows); pair_results is legacy/read-only now.
     db.add(record(AggregateResult,m.id,rc.id,result,snapshot_id=raw.id))
     db.add(ResultOutbox(payload={'type':'result','monitorId':m.id,'snapshotId':raw.id},created_at=nowstr()))
     db.commit(); return result

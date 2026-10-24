@@ -64,3 +64,12 @@ def test_refresh_manual_no_acquisition(cfg,sample):
 def test_origin_rejected():
     r=client.post('/api/monitors',json={},headers={'origin':'https://untrusted.example'})
     assert r.status_code==403
+
+def test_pair_results_not_written_but_exported(cfg,sample):
+    with Session() as db:
+        m=create_monitor(db,cfg); s=sample(); s.monitorId=m.id; r=save_snapshot(db,s)
+        assert db.scalar(select(func.count()).select_from(PairResult).where(PairResult.monitor_id==m.id))==0
+    export=client.get(f'/api/exports/{m.id}').json()
+    assert list(export)[:4]==['run_configs','raw_snapshots','pair_results','aggregate_results']
+    assert export['pair_results'][0]['payload']=={k:v['rows'] for k,v in r['modes'].items()}
+    assert export['pair_results'][0]['snapshot_id']==r['snapshotId']
