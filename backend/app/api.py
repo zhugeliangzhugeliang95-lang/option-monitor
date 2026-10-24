@@ -213,7 +213,7 @@ async def stream(request:Request,lastEventId:str|None=None):
     last=parse_event_id(request.headers.get('last-event-id'))
     if last is None: last=parse_event_id(lastEventId)
     queue=asyncio.Queue(maxsize=100); subscribers.add(queue)
-    return StreamingResponse(sse_events(queue,last,request.is_disconnected),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+    return StreamingResponse(sse_events(queue,last,request.is_disconnected),media_type='text/event-stream',headers={'Cache-Control':'no-cache, no-transform','X-Accel-Buffering':'no'})
 @app.post('/api/research/frozen-observations')
 def freeze(body:dict):
     with Session() as db:
