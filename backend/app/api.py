@@ -9,7 +9,7 @@ from sqlalchemy import select, func
 from .db import *
 from .models import Config, Snapshot, utcnow
 from .engine import compute, BASES
-from .service import create_monitor, revise, save_snapshot, statistics_for
+from .service import create_monitor, revise, save_snapshot, statistics_for, summary_columns, summary_row
 from .providers import provider_for, ProviderError
 from .imports import parse_import
 
@@ -94,22 +94,35 @@ def preview(mid:str,body:dict):
         cfg=Config.model_validate({**rc.payload,**changes}); result=compute(cfg,Snapshot.model_validate(raw.payload))
         return {**result,'preview':True,'historicalRecalculation':True,'snapshotId':raw.id,'configHash':rc.hash}
 @app.get('/api/results/latest')
-def latest():
+def latest(summary:bool=False):
     with Session() as db:
         out={}
         for m in db.scalars(select(Monitor).where(Monitor.active==True)):
-            row=db.scalar(select(AggregateResult).where(AggregateResult.monitor_id==m.id).order_by(AggregateResult.id.desc()).limit(1))
-            if row:
+            if summary:
+                r=db.execute(select(*summary_columns()).where(AggregateResult.monitor_id==m.id).order_by(AggregateResult.id.desc()).limit(1)).first()
+                payload,config_id=(summary_row(r),None) if r else (None,None)
+                if payload: config_id=payload['configId']
+            else:
+                row=db.scalar(select(AggregateResult).where(AggregateResult.monitor_id==m.id).order_by(AggregateResult.id.desc()).limit(1))
+                payload,config_id=(row.payload,row.config_id) if row else (None,None)
+            if payload:
                 st=db.scalar(select(StatisticalResult).where(StatisticalResult.monitor_id==m.id,StatisticalResult.config_id==m.config_id).order_by(StatisticalResult.id.desc()).limit(1))
-                out[m.id]={**row.payload,'oldConfiguration':row.config_id!=m.config_id,'statistics':st.payload if st else None}
+                out[m.id]={**payload,'oldConfiguration':config_id!=m.config_id,'statistics':st.payload if st else None}
         return out
 @app.get('/api/monitors/{mid}/history')
-def history(mid:str,limit:int=200,before:int|None=None):
+def history(mid:str,limit:int=200,before:int|None=None,after:int|None=None,summary:bool=False):
     with Session() as db:
-        monitor(db,mid); query=select(AggregateResult).where(AggregateResult.monitor_id==mid)
+        monitor(db,mid); limit=min(max(limit,1),500)
+        query=select(*summary_columns()) if summary else select(AggregateResult)
+        query=query.where(AggregateResult.monitor_id==mid)
         if before: query=query.where(AggregateResult.id<before)
-        rows=db.scalars(query.order_by(AggregateResult.id.desc()).limit(min(max(limit,1),500))).all()
-        return [{'id':r.id,**r.payload} for r in reversed(rows)]
+        if after is not None:
+            # Incremental: oldest records newer than `after`, ascending.
+            query=query.where(AggregateResult.id>after).order_by(AggregateResult.id.asc()).limit(limit); ordered=lambda rows: rows
+        else:
+            query=query.order_by(AggregateResult.id.desc()).limit(limit); ordered=lambda rows: list(reversed(rows))
+        if summary: return [summary_row(r) for r in ordered(db.execute(query).all())]
+        return [{'id':r.id,**r.payload} for r in ordered(db.scalars(query).all())]
 @app.get('/api/snapshots/{sid}')
 def raw_snapshot(sid:int):
     with Session() as db:

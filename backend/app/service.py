@@ -1,4 +1,4 @@
-import uuid
+import json, uuid
 from datetime import datetime, timedelta
 from sqlalchemy import select, func
 from .db import *
@@ -88,3 +88,21 @@ def persist_statistics(db,asof):
         # Closed block snapshots are append-only audit revisions, never overwritten.
         db.add(record(MinuteBlock,m.id,m.config_id,{'statsAsOf':asof.isoformat(),'blocks':s['blocks']}))
     db.add(ResultOutbox(payload={'type':'statistics','statsAsOf':asof.isoformat()},created_at=nowstr())); db.commit()
+
+SUMMARY_SCALARS=('snapshotId','valuationAt','configId','configVersion','feedType','historical','duplicate','status','stockReference','composition')
+SUMMARY_MODE_KEYS=('rawMean','validatedMean','rawGapBps')
+def summary_columns():
+    """Compact history record (~1% of the full payload) built from json_extract columns; values come from SQLite as exact Python scalars."""
+    j=lambda path: func.json_extract(AggregateResult.payload,path)
+    cols=[AggregateResult.id]+[j(f'$.{k}') for k in SUMMARY_SCALARS]+[func.json_type(AggregateResult.payload,'$.stockReference')]
+    cols+=[j(f'$.modes."{m}".{k}') for m in BASES for k in SUMMARY_MODE_KEYS]+[func.json_type(AggregateResult.payload,f'$.modes."{m}"') for m in BASES]
+    return cols
+def summary_row(row):
+    row=list(row); out={'id':row[0],**dict(zip(SUMMARY_SCALARS,row[1:11]))}; rest=row[12:]
+    for k in ('historical','duplicate'):
+        if out[k] is not None: out[k]=bool(out[k])
+    if row[11] in ('object','array'): out['stockReference']=json.loads(out['stockReference'])
+    out['composition']=json.loads(out['composition']) if out['composition'] is not None else None
+    n=len(SUMMARY_MODE_KEYS); present=rest[len(BASES)*n:]
+    out['modes']={m:dict(zip(SUMMARY_MODE_KEYS,rest[i*n:(i+1)*n])) for i,m in enumerate(BASES) if present[i]=='object'}
+    return out

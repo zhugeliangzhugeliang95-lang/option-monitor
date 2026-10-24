@@ -14,8 +14,8 @@
 | POST /api/monitors/{id}/preview-price-basis | snapshotId和optionPricePreset、callPriceBasis、putPriceBasis、stockReferenceBasis；不写新样本 |
 | POST /api/manual-snapshots | Snapshot；provider=manual，quote.feedType=MANUAL |
 | POST /api/imports/quotes | monitorId、format(csv/tsv/json)、content、metadata；标记人工历史 |
-| GET /api/results/latest | 按monitorId返回最后结果；标记旧配置 |
-| GET /api/monitors/{id}/history | limit≤500、可选before结果ID；按时序返回 |
+| GET /api/results/latest | 按monitorId返回最后结果；标记旧配置；`?summary=1` 返回精简字段（id、snapshotId、valuationAt、configId、configVersion、feedType、historical、duplicate、status、stockReference、composition、modes{mode:{rawMean,validatedMean,rawGapBps}}） |
+| GET /api/monitors/{id}/history | limit≤500、可选before结果ID；可选after结果ID（返回之后最早的limit条，升序）；`summary=1` 返回同上精简字段；按时序返回 |
 | GET /api/snapshots/{id} | 原始输入、当时配置与hash |
 | GET /api/monitors/{id}/statistics | 最后主要统计；可选mode计算其他口径，标记历史重算且不入主要族 |
 | GET /api/providers/status | worker心跳、各监测最近状态、耗时、延迟、退避 |
