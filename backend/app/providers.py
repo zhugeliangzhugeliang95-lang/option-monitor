@@ -21,6 +21,18 @@ class Provider(Protocol):
     async def get_option_quotes(self,contracts:list[Contract])->dict[str,Quote]: ...
     async def close(self): ...
 
+def exchange_day(cfg,now):
+    """ISO trading date of `now` in the config's exchange timezone (caller supplies the clock)."""
+    return now.astimezone(ZoneInfo(cfg.exchangeTimezone)).date().isoformat()
+
+def live_expirations(dates,today):
+    """Drop expirations before `today` (exchange date, ISO). today itself is 0DTE and kept."""
+    return [d for d in dates if str(d)>=today]
+
+def target_expiry(cfg,today):
+    """sameDay -> today; manual -> the configured date, never substituted (even when expired)."""
+    return today if cfg.expiryMode=='sameDay' else cfg.expiration
+
 def regular_session(cfg,at):
     try:
         cal=xcals.get_calendar(cfg.calendar)

@@ -5,7 +5,7 @@ from sqlalchemy import select
 from .db import *
 from .models import Config, Snapshot, Leg, utcnow
 from .engine import selected_strikes
-from .providers import provider_for, ProviderError, regular_session
+from .providers import provider_for, ProviderError, regular_session, exchange_day, live_expirations, target_expiry
 from .service import save_snapshot, persist_statistics
 from . import retention
 from .logs import configure as configure_logging
@@ -34,8 +34,8 @@ class Worker:
                     else:
                         state=await provider.get_market_state(cfg)
                         if underlying is None: raise ProviderError('MISSING_UNDERLYING')
-                        at=utcnow(); day=at.astimezone(ZoneInfo(cfg.exchangeTimezone)).date().isoformat(); expiry=day if cfg.expiryMode=='sameDay' else cfg.expiration
-                        expirations=await provider.list_expirations(cfg)
+                        at=utcnow(); day=exchange_day(cfg,at); expiry=target_expiry(cfg,day)
+                        expirations=live_expirations(await provider.list_expirations(cfg),day)
                         contracts=await provider.list_option_contracts(cfg,expiry) if expiry in expirations else []
                         chosen=selected_strikes(contracts,underlying.last,cfg.nBelow,cfg.nAbove) if underlying.last is not None else []
                         wanted={k for k,_ in chosen}; selected=[c for c in contracts if c.strike in wanted]
