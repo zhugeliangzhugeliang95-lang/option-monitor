@@ -6,6 +6,10 @@ from app.futu import FutuProvider, quote_from_row
 from app.models import Config, Snapshot, Leg
 from app.providers import ProviderError
 from app.engine import compute
+from datetime import datetime as _dt, timezone as _tz
+# Fixtures use 2026-10-19..23 expirations; pin the provider clock so they are not 'expired'.
+CLOCK19=lambda:_dt(2026,10,19,15,0,tzinfo=_tz.utc)
+CLOCK23=lambda:_dt(2026,10,23,15,0,tzinfo=_tz.utc)
 
 
 class OpenD:
@@ -62,7 +66,7 @@ async def test_permissions_block_quotes_and_diagnostic_redacts():
 
 @pytest.mark.asyncio
 async def test_real_snapshot_mapping_and_exclusion(at):
-    ctx=OpenD();p=FutuProvider(ctx)
+    ctx=OpenD();p=FutuProvider(ctx,clock=CLOCK19)
     cfg=Config(provider='futu',dataMode='API',nBelow=1,timeRule='days365',remainingDays=1)
     try:
         assert (await p.get_capabilities()).feedType=='UNKNOWN'
@@ -138,7 +142,7 @@ async def test_supported_universe_batch_and_metadata_error_isolation():
                     option_strike_price=999 if symbol=='NVDA' and option else 100,
                     option_contract_size=100,option_type='CALL' if code.endswith(':C') else 'PUT'))
             return 0,pd.DataFrame(rows)
-    ctx=BatchOpenD();p=FutuProvider(ctx)
+    ctx=BatchOpenD();p=FutuProvider(ctx,clock=CLOCK23)
     configs={s:Config(symbol=s,underlyingId=s,provider='futu',dataMode='API',expiryMode='manual',expiration='2026-10-23',nBelow=1,timeRule='days365',remainingDays=4) for s in FUTU_SYMBOLS}
     p.expirations=lambda cfg, **kwargs:['2026-10-23']
     p.contracts=lambda cfg,expiry, **kwargs:[Contract(id=code_for(cfg.underlyingId)+':'+right,underlyingId=cfg.underlyingId,expiration=expiry,strike=100,right=right) for right in ('C','P')]
@@ -159,7 +163,7 @@ async def test_supported_universe_batch_and_metadata_error_isolation():
 @pytest.mark.asyncio
 async def test_batch_keeps_ready_symbols_when_one_chain_is_rate_limited():
     ctx=OpenD();ctx.get_market_state=lambda codes:(0,pd.DataFrame([{'code':c,'market_state':'AFTERNOON'} for c in codes]))
-    p=FutuProvider(ctx);original=p.expirations
+    p=FutuProvider(ctx,clock=CLOCK19);original=p.expirations
     def dates(cfg, **kwargs):
         if cfg.underlyingId=='QQQ':raise ProviderError('RATE_LIMITED',30)
         return original(cfg, **kwargs)
@@ -209,7 +213,7 @@ async def test_worker_persists_batched_futu_results(sample):
 @pytest.mark.asyncio
 async def test_batch_checks_permission_once_even_when_metadata_is_slow():
     ctx=OpenD();ctx.get_market_state=lambda codes:(0,pd.DataFrame([{'code':c,'market_state':'AFTERNOON'} for c in codes]))
-    p=FutuProvider(ctx);original=p.permissions;checks=[]
+    p=FutuProvider(ctx,clock=CLOCK19);original=p.permissions;checks=[]
     def permission(*args,**kwargs):
         checks.append(1)
         return original(*args,**kwargs)
@@ -221,3 +225,63 @@ async def test_batch_checks_permission_once_even_when_metadata_is_slow():
         assert len(checks)==1
         assert ctx.calls.count('snapshot')==2
     finally:await p.close()
+
+
+# --- expired expirations are skipped (item 3) ---
+from app.providers import live_expirations, exchange_day
+DATES=['2026-10-22','2026-10-23','2026-10-24','2026-10-26','2026-10-30']
+def CLOCK24(): return _dt(2026,10,24,14,0,tzinfo=_tz.utc)  # 10:00 New York, Sat 10-24
+
+def test_live_expirations_keeps_today_and_future():
+    assert live_expirations(DATES,'2026-10-24')==['2026-10-24','2026-10-26','2026-10-30']
+    # 03:30 UTC on 10-24 is still 10-23 in New York: 10-23 is today (0DTE) there, not expired.
+    cfg=Config()
+    assert exchange_day(cfg,_dt(2026,10,24,3,30,tzinfo=_tz.utc))=='2026-10-23'
+
+class ChainOpenD(OpenD):
+    def get_option_expiration_date(self, code):
+        self.calls.append('expirations'); return 0, pd.DataFrame([{'strike_time':d} for d in reversed(DATES)])
+    def get_option_chain(self, code, start, end):
+        self.calls.append(('chain',start)); self.expiry=start; return super().get_option_chain(code,start,end)
+    def get_market_snapshot(self, codes):
+        ret,df=super().get_market_snapshot(codes); df['strike_time']=getattr(self,'expiry','2026-10-19'); return ret,df
+    def get_market_state(self, codes):
+        return 0, pd.DataFrame([{'code':c,'market_state':'AFTERNOON'} for c in codes])
+
+@pytest.mark.asyncio
+async def test_futu_expirations_drop_expired():
+    p=FutuProvider(ChainOpenD(),clock=CLOCK24)
+    try: assert await p.list_expirations(Config(provider='futu',dataMode='API'))==['2026-10-24','2026-10-26','2026-10-30']
+    finally: await p.close()
+
+@pytest.mark.asyncio
+async def test_batch_same_day_uses_today_not_expired():
+    ctx=ChainOpenD();p=FutuProvider(ctx,clock=CLOCK24)
+    try:
+        cfg=Config(provider='futu',dataMode='API',nBelow=1)
+        snaps,errors=await p.collect_batch({'m':cfg})
+        assert not errors and ('chain','2026-10-24') in ctx.calls
+        assert not any(c==('chain','2026-10-23') for c in ctx.calls)
+        assert compute(cfg,snaps['m'])['expiration']=='2026-10-24'
+    finally: await p.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fixed,status_expired',[('2026-10-23',True),('2026-10-24',False),('2026-10-26',False)])
+async def test_batch_fixed_expiration_expired_is_reported_not_substituted(fixed,status_expired):
+    ctx=ChainOpenD();p=FutuProvider(ctx,clock=CLOCK24)
+    try:
+        cfg=Config(provider='futu',dataMode='API',nBelow=1,expiryMode='manual',expiration=fixed)
+        snaps,errors=await p.collect_batch({'m':cfg})
+        chains=[c[1] for c in ctx.calls if isinstance(c,tuple)]
+        r=compute(cfg,snaps['m'])
+        assert r['expiration']==fixed
+        if status_expired:
+            assert chains==[] and r['status']=='EXPIRED' and r['composition']==[]
+        else:
+            assert chains==[fixed] and r['status']!='EXPIRED'
+    finally: await p.close()
+
+def test_engine_expired_fixed_expiration_status(cfg,sample):
+    s=sample(); cfg.expiryMode='manual'; cfg.expiration='2026-10-18'  # valuation day 2026-10-19
+    assert compute(cfg,s)['status']=='EXPIRED'
+    cfg.expiration='2026-10-19'; assert compute(cfg,s)['status']!='EXPIRED'
