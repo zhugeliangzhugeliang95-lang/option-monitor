@@ -40,6 +40,8 @@ async def lifespan(app):
     task=asyncio.create_task(broadcast())
     yield
     task.cancel(); await asyncio.gather(task,return_exceptions=True)
+from .logs import configure as _configure_logging
+_configure_logging()  # uvicorn configures its loggers before importing the app; wrap them with redaction
 app=FastAPI(title='期权反推价格监测台',version='1.0.0',lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=LOCAL_ORIGINS,allow_methods=['*'],allow_headers=['*'])
 @app.middleware('http')
