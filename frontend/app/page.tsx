@@ -9,10 +9,10 @@ import { FocusWatch,MultiOverview,OverviewMain } from './Overview';
 import { ManualPanel } from './ManualPanel';
 import { SettingsPanel } from './SettingsPanel';
 import { HistoryPanel } from './HistoryPanel';
-import { CreateModal,RawModal } from './Modals';
+import { CreateModal,AskModal,RawModal } from './Modals';
 export default function Dashboard(){
  const d=useDashboard();
- const {monitors,selected,provider,history,tab,error,setError,notice,setNotice,connected,zone,setZone,busy,showCreate,setShowCreate,setNewProvider,raw,current,run,cfg,result}=d;
+ const {monitors,selected,provider,history,tab,error,setError,notice,setNotice,connected,zone,setZone,busy,showCreate,setShowCreate,setNewProvider,raw,ask,current,run,cfg,result}=d;
  return <div className="app-shell">
    <Sidebar d={d}/>
   <main><header className="topbar"><div><span className="muted">工作台</span><ChevronRight size={13}/><span>{{overview:'监测总览',manual:'人工报价',history:'历史与追溯',settings:'监测配置'}[tab]}</span></div><div><Connection connected={connected} heartbeatAt={provider.worker?.heartbeatAt}/><span className="divider"/><select aria-label="显示时区" value={zone} onChange={e=>setZone(e.target.value)}><option value="America/New_York">纽约时间</option><option value="Asia/Shanghai">北京时间</option><option value="UTC">UTC</option></select></div></header>
@@ -33,6 +33,7 @@ export default function Dashboard(){
    <footer className="app-footer"><span>PARITY LAB / RESEARCH TERMINAL</span><span>目标节拍 10s · {zone} · 无自动下单</span></footer>
   </div></main>
   {showCreate&&<CreateModal d={d}/>}
+  {ask&&<AskModal d={d}/>}
   {raw&&<RawModal d={d}/>}
  </div>;
 }
