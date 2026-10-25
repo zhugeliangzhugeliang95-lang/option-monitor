@@ -13,47 +13,72 @@ FORMAT='%(asctime)s %(levelname)s %(name)s %(message)s'
 COVERED_LOGGERS=('', 'app', 'futu', 'FTFileLog', 'FTConsoleLog', 'uvicorn', 'uvicorn.error', 'uvicorn.access')
 MASK='***'
 
-# --- key-name classification (token-aware; split on _ - . and camelCase) ---
-_ALWAYS={'password','passwd','passphrase','pwd','pw','token','secret','authorization','cookie','session','apikey','credential','credentials'}
+# --- key-name classification (token-aware; split on _ - . whitespace and camelCase) ---
+# Sensitive words are matched against whole tokens or concatenations of adjacent tokens, so
+# PassWord / pass_word -> "password", FUTU_ACC_ID -> "acc"+"id", but passport/compass/bypass,
+# monkey, keys, keyboard are single tokens that are not in the lists and stay visible.
+_ALWAYS={'password','passwd','passphrase','pass','pwd','pw','token','secret','authorization','cookie',
+        'apikey','credential','credentials','privatekey','secretkey','accesskey'}
 _ACCOUNT={'account','acc','acct'}
-_KEY_PREFIX={'api','secret','private','access','auth','client','signing','encryption','session'}
+_ACCOUNT_SUFFIX={'id','no','num','number'}
+_KEY_PREFIX={'api','secret','private','access','auth','client','signing','encryption','session',
+             'rsa','dsa','ec','ssh','pem','gpg','pgp','hmac','jwt','master','app','sign'}
 
 def _tokens(name):
     name=re.sub(r'([a-z0-9])([A-Z])',r'\1_\2',name)
+    name=re.sub(r'([A-Z]+)([A-Z][a-z])',r'\1_\2',name)
     return [t for t in re.split(r'[_\-.\s]+',name.lower()) if t]
+
+def _spans(t):
+    for i in range(len(t)):
+        for j in range(i+1,min(len(t),i+3)+1): yield i,j,''.join(t[i:j])
 
 def sensitive_name(name):
     t=_tokens(name)
     if not t: return False
-    joined=''.join(t)
-    if any(x in _ALWAYS for x in t) or joined in ('apikey','accountid','accid','acctid','userid','privatekey','secretkey','accesskey'): return True
-    if 'key' in t:   # 'key' only as a whole token: key=, api_key, secret-key; never monkey/keys/keyboard
-        i=t.index('key'); return len(t)==1 or i==len(t)-1 and (t[i-1] in _KEY_PREFIX or len(t)==1) or i>0 and t[i-1] in _KEY_PREFIX
-    if t[0] in _ACCOUNT and (len(t)==1 or t[1:]==['id'] or t[1:]==['no'] or t[1:]==['number']): return True
-    if t==['user','id']: return True
-    return False
+    if any(w in _ALWAYS for _,_,w in _spans(t)): return True
+    for i,w in enumerate(t):
+        if w=='key' and (len(t)==1 or any(x in _KEY_PREFIX for x in t[:i])): return True
+        if w in _ACCOUNT and (i==len(t)-1 or t[i+1] in _ACCOUNT_SUFFIX): return True
+        if w in ('session','sessionid','sid') and (len(t)==1 or i+1<len(t) and t[i+1] in ('id','cookie')): return True
+        if w=='user' and i+1<len(t) and t[i+1]=='id': return True
+    return any(w in ('accountid','accid','acctid','userid','accno') for _,_,w in _spans(t))
 
-_VALUE=r'''(?:'[^']*'|"[^"]*"|[^\s,;&)}\]'"]+)'''
-_AUTH=re.compile(r'''(?i)(\b(?:proxy-)?authorization['"]?\s*[:=]\s*['"]?)(?:(bearer|basic|token|digest|negotiate)\s+)?[^\s'",;}]+''')
-_KV=re.compile(r'''(?<![\w-])(['"]?)([A-Za-z_][\w.-]*)\1(\s*[:=]\s*)('''+_VALUE+')')
-_EQ=re.compile(r'''(?<![\w-])([A-Za-z_][\w.-]*)=([^&\s,;)'"}\]]+)''')  # also inside quoted strings (URLs)
-_SPACED=re.compile(r'''(?i)\b(password|passwd|pwd|pw|token|secret)(\s+)(?!=|:)([^\s,;'"]+)''')
-_ACCOUNT_NUM=re.compile(r'''(?i)\b(acc(?:ount)?|acct)((?:[_-]?(?:id|no|number))?['"]?[\s:=#'"]*)(\d{4,})''')
+# Unquoted values never contain '=' so 'ValueError: password=...' cannot swallow the next key.
+_VALUE=r"""(?:'[^']*'|"[^"]*"|[^\s,;&)}\]'"=]+)"""
+_AUTH_SCHEME=r"(?:(bearer|basic|token|digest|negotiate|ntlm|hmac[\w-]*)\s+)?"
+# quoted repr ('Authorization': 'Digest ...'): mask up to the closing quote
+_AUTH_Q=re.compile(r"""(?i)(['"](?:proxy-)?authorization['"]\s*[:=]\s*(['"]))"""+_AUTH_SCHEME+r"""(?:(?!\2).)+""")
+# header style (Authorization: Digest username="x", response="y"): mask the rest of the line
+_AUTH=re.compile(r"""(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)"""+_AUTH_SCHEME+r"""[^\r\n]+""")
+_KV=re.compile(r"""(?<![\w-])(['"]?)([A-Za-z_][\w.-]*)\1(\s*[:=]\s*)("""+_VALUE+')')
+_EQ=re.compile(r"""(?<![\w-])([A-Za-z_][\w.-]*)=([^&\s,;)'"}\]]+)""")  # also inside quoted strings (URLs)
+_SPACED=re.compile(r"""(?i)\b(password|passwd|pwd|pw|token|secret)(\s+)(?!=|:)([^\s,;'"]+)""")
+_ACCOUNT_NUM=re.compile(r"""(?i)\b(acc(?:ount)?|acct)((?:[_-]?(?:id|no|number))?['"]?[\s:=#'"]*)(\d{4,})""")
 _SCHEME_TOKEN=re.compile(r'(?i)\b(bearer|basic)\s+(?!\*\*\*)[A-Za-z0-9._~+/=-]{6,}')
 _URL_CREDS=re.compile(r'(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@')
 
-def _kv(m):
-    q,name,sep,val=m.groups()
-    if not sensitive_name(name): return m.group(0)
-    if val[:1] in '\'"': return f'{q}{name}{q}{sep}{val[0]}{MASK}{val[0]}'
-    return f'{q}{name}{q}{sep}{MASK}'
+def _kv_scan(text):
+    """Mask sensitive `name<sep>value`. If the name is not sensitive, only the name is consumed and
+    scanning resumes right after it, so `ValueError: password='x'` still reaches `password`."""
+    out,pos=[],0
+    while True:
+        m=_KV.search(text,pos)
+        if not m: out.append(text[pos:]); return ''.join(out)
+        q,name,sep,val=m.groups()
+        if sensitive_name(name) and not val.strip('\'"').startswith(MASK):
+            masked=f'{val[0]}{MASK}{val[0]}' if val[:1] in '\'"' else MASK
+            out.append(text[pos:m.start()]+f'{q}{name}{q}{sep}{masked}'); pos=m.end()
+        else:
+            out.append(text[pos:m.end(2)]); pos=m.end(2)
 
 def redact(text):
     text=str(text)
-    text=_AUTH.sub(lambda m: m.group(1)+(m.group(2)+' ' if m.group(2) else '')+MASK,text)
+    text=_AUTH_Q.sub(lambda m: m.group(1)+(m.group(3)+' ' if m.group(3) else '')+MASK,text)
+    text=_AUTH.sub(lambda m: m.group(0) if m.group(0).rstrip().endswith(MASK+"'") or m.group(0).rstrip().endswith(MASK+'"') else m.group(1)+(m.group(2)+' ' if m.group(2) else '')+MASK,text)
     text=_URL_CREDS.sub(r'\1***:***@',text)
     text=_EQ.sub(lambda m: m.group(1)+'='+MASK if sensitive_name(m.group(1)) and m.group(2)!=MASK else m.group(0),text)
-    text=_KV.sub(_kv,text)
+    text=_kv_scan(text)
     text=_SPACED.sub(lambda m: m.group(0) if m.group(3).startswith(MASK) else m.group(1)+m.group(2)+MASK,text)
     text=_ACCOUNT_NUM.sub(r'\1\2'+MASK,text)
     text=_SCHEME_TOKEN.sub(r'\1 '+MASK,text)
@@ -79,8 +104,9 @@ def protect_loggers(names=COVERED_LOGGERS):
         for h in logging.getLogger(n or None).handlers: protect_handler(h)
 
 def configure(level=None,stream=None):
-    """Idempotent: one stdout handler on 'app' and on root (if root has none), then a redacting
-    formatter on every handler of every covered logger."""
+    """Idempotent: one stdout handler on 'app'; one on root only if root has no handler at all
+    (existing root handlers are kept and wrapped, never duplicated); then a redacting formatter
+    on every handler of every covered logger. Calling it twice adds nothing."""
     app=logging.getLogger('app')
     level=(level or os.getenv('LOG_LEVEL','INFO')).upper()
     app.setLevel(level if level in logging._nameToLevel else 'INFO')
@@ -88,7 +114,7 @@ def configure(level=None,stream=None):
         h=logging.StreamHandler(stream or sys.stdout); h._app_handler=True
         app.addHandler(h); app.propagate=False
     root=logging.getLogger()
-    if not any(getattr(h,'_app_handler',False) for h in root.handlers):
+    if not root.handlers:   # never add a duplicate: existing root handlers are wrapped below instead
         h=logging.StreamHandler(stream or sys.stdout); h._app_handler=True; root.addHandler(h)
     try: import futu  # noqa: F401  instantiates the SDK's FTLog handlers so they can be wrapped
     except Exception: pass

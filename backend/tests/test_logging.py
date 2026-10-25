@@ -105,7 +105,54 @@ def test_third_party_logger_handlers_redacted(name):
     assert 'GET /x' in out and not any(s in out for s in ('tok_ABC123','hunter2','28001234')), out
 
 def test_futu_sdk_logger_propagates_to_redacting_root():
-    stream=capture(); lg=logging.getLogger('futu.sdk.child')
-    root=logging.getLogger(); h=[h for h in root.handlers if getattr(h,'_app_handler',False)][0]; h.setStream(stream)
-    lg.error('unlock password: hunter2')
-    assert 'unlock password: ***' in stream.getvalue()
+    stream=io.StringIO(); root=logging.getLogger(); h=logging.StreamHandler(stream); root.addHandler(h)
+    try:
+        configure(); logging.getLogger('futu.sdk.child').error('unlock password: hunter2')
+        assert 'unlock password: ***' in stream.getvalue()
+    finally: root.removeHandler(h)
+
+
+# --- round 2 (review at b8cf37f) ---
+@pytest.mark.parametrize('text,secret',[
+    ("ValueError: password='hunter2'",'hunter2'),          # blocker 1: <word>: key=value
+    ('error: password="hunter2"','hunter2'),
+    ("cfg: password='a b'",'a b'),
+    ('PassWord: hunter2','hunter2'),                        # camelCase pass+word
+    ('pass: hunter2','hunter2'),
+    ('url?pass=hunter2','hunter2'),
+    ('FUTU_ACC_ID=28001234','28001234'),                    # acc+id at any token position
+    ('FUTU_ACCOUNT_NO=28001234','28001234'),
+    ('FUTU_RSA_KEY=MIIEvQIBADANBg','MIIEvQIBADANBg'),
+    ('rsa_private_key=MIIEvQIBADANBg','MIIEvQIBADANBg'),
+    ('Authorization: Digest username=x, response=hunter2','hunter2'),
+    ('session_id=abc123def','abc123def'),
+])
+def test_redacts_round2(text,secret):
+    out=redact(text); assert secret not in out and '***' in out, out
+
+def test_digest_whole_credential_masked():
+    out=redact('Authorization: Digest username="bob", realm="r", nonce="n1", response="hunter2"')
+    assert 'bob' not in out and 'n1' not in out and 'hunter2' not in out, out
+
+@pytest.mark.parametrize('text',['passport=E123','compass: north','bypass=1','password_policy_note','monkey=banana','keys=SPY',
+                                 'keyboard=us','account_balance=5','a: b=c','optionSessionOpen=False','ValueError: bad strike=450'])
+def test_round2_not_masked(text):
+    assert redact(text)==text
+
+def test_exc_info_last_line_key_value_masked():
+    stream=capture(); log=logging.getLogger('app.test')
+    try: raise ValueError("password='hunter2'")
+    except ValueError: log.exception('failed')
+    out=stream.getvalue(); last=out.strip().splitlines()[-1]
+    assert last=="ValueError: password='***'" and 'hunter2' not in out, out
+
+def test_configure_twice_no_double_logging():
+    root=logging.getLogger(); before=list(root.handlers)
+    stream=io.StringIO(); h=logging.StreamHandler(stream); root.addHandler(h)
+    try:
+        configure(); configure()
+        assert len(root.handlers)==len(before)+1   # no duplicate root handler when one exists
+        logging.getLogger('other.lib').error('once password=hunter2')
+        assert stream.getvalue().count('once')==1 and 'hunter2' not in stream.getvalue()
+        app=logging.getLogger('app'); n=sum(getattr(x,'_app_handler',False) for x in app.handlers); assert n==1
+    finally: root.removeHandler(h)
