@@ -38,7 +38,10 @@ def quality(q,basis,at,cfg):
 def selected_strikes(contracts,spot,nb,na):
     keys=sorted(set(c.strike for c in contracts))
     s=Decimal(str(spot))
-    return [(k,'below') for k in sorted((k for k in keys if k<s),reverse=True)[:nb]]+[(k,'above') for k in keys if k>s][:na]
+    # A strike exactly equal to the anchor (Decimal compare, so 450 == 450.0) is included as the
+    # at-the-money strike in addition to nb below and na above; otherwise selection is unchanged.
+    at=[(k,'at') for k in keys if k==s and (nb or na)]
+    return [(k,'below') for k in sorted((k for k in keys if k<s),reverse=True)[:nb]]+at+[(k,'above') for k in keys if k>s][:na]
 
 def summary(rows,requested):
     vals=[r['value'] for r in rows if r['value'] is not None]
@@ -47,7 +50,8 @@ def summary(rows,requested):
         a=[r['value'] for r in rows if r['side']==side and r['value'] is not None]
         return mean(a) if a else None
     return dict(rawMean=mean(vals) if vals else None,validatedMean=mean(valid) if valid else None,
-        belowMean=avg('below'),aboveMean=avg('above'),validCount=len(valid),computableCount=len(vals),requestedCount=requested,
+        # 'at' rows count in rawMean/validatedMean/std/median/min/max but in neither side mean.
+        belowMean=avg('below'),aboveMean=avg('above'),atValue=next((r['value'] for r in rows if r['side']=='at'),None),validCount=len(valid),computableCount=len(vals),requestedCount=requested,
         std=stdev(vals) if len(vals)>1 else (0 if vals else None),median=median(vals) if vals else None,
         min=min(vals) if vals else None,max=max(vals) if vals else None)
 
@@ -60,6 +64,7 @@ def compute(cfg:Config,s:Snapshot):
     anchor=price_selector(s.underlying,'LAST')
     anchor_errors=quality(s.underlying,'LAST',s.valuationAt,cfg)
     selected=selected_strikes(catalog,anchor,cfg.nBelow,cfg.nAbove) if anchor is not None else []
+    if any(side=='at' for _,side in selected): req+=1
     ref=price_selector(s.underlying,cfg.stockReferenceBasis)
     modes={}
     for mode in BASES:

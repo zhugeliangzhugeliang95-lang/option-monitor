@@ -8,7 +8,11 @@
 
 真实合成盘口下界 `C_bid−P_ask+PV(K)`，上界 `C_ask−P_bid+PV(K)`。高侧grossGap为下界−正股ask；低侧为正股bid−上界。不是保证可实现收益，也不是置信区间。ASK反推可以小于BID。
 
-选档先按Decimal行权价与S_last比较；低侧严格小于，降序取N；高侧严格大于，升序取N。平值排除。先定档，再检查腿，不替换坏档。无可靠Last时可展示原始计算，但不能视为严格选档或统计合格。
+选档先按Decimal行权价与S_last比较；低侧严格小于，降序取nBelow；高侧严格大于，升序取nAbove。先定档，再检查腿，不替换坏档。
+
+平值档（ATM）：仅当 S_last 与某个行权价**完全相等**（按 Decimal 比较，450 = 450.0 = 450.00）时，该档以 side=`at` 额外纳入，位于低侧与高侧之间：nBelow=nAbove=5 时共 11 档（5 低 + 1 平值 + 5 高），requestedCount = nBelow+nAbove+1。S_last=450.01 等不相等的情况不算平值，仍为 10 档（5 低、5 高）。平值档计入 rawMean/validatedMean/std/median/min/max，但不计入 belowMean/aboveMean，单独输出 atValue。
+- 11 档需要 nBelow 与 nAbove 都设为 5。后端默认值仍为 0/0；0/0 时不选任何档（也不选平值档），状态为 PLEASE_SET_COUNTS。
+- 已有监测对象的配置不会被自动修改；新建监测对象默认 5/5 由前端 PR #8 提供。无可靠Last时可展示原始计算，但不能视为严格选档或统计合格。
 
 一个K贡献一个值；总体均值直接平均所有有效K，不将两侧均值五五混合。rawMean使用所有可计算K，validatedMean仅使用质量合格K；严格时点要求全部请求档位都齐全合格且正股对照有效、常规正股与期权时段交集开放。
 
