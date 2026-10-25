@@ -127,3 +127,8 @@ def test_atm_decimal_vs_float(spot,has_at):
 def test_atm_not_selected_when_counts_zero(cfg,sample):
     cfg.nBelow=0;cfg.nAbove=0
     r=compute(cfg,sample(STRIKES,450)); assert r['composition']==[] and r['status']=='PLEASE_SET_COUNTS'
+
+def test_atm_spot_450_01_is_not_at(cfg,sample):
+    cfg.nBelow=5;cfg.nAbove=5
+    rows=compute(cfg,sample(STRIKES,450.01))['modes']['MID']['rows']; sides=[x['side'] for x in rows]
+    assert len(rows)==10 and (sides.count('below'),sides.count('at'),sides.count('above'))==(5,0,5)
