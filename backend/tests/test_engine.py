@@ -21,7 +21,7 @@ def test_custom(cfg,sample,cb,pb,expected):
 def test_nearest_decimal_and_atm(cfg,sample):
     cfg.nBelow=2;cfg.nAbove=2
     r=compute(cfg,sample((590,595,600,605,610,615),600))
-    assert r['composition']==['595','590','605','610']
+    assert r['composition']==['595','590','600','605','610']
 def test_zero_and_one_side(cfg,sample):
     cfg.nBelow=0
     r=compute(cfg,sample());assert r['status']=='PLEASE_SET_COUNTS';assert r['modes']['MID']['rawMean'] is None
@@ -94,3 +94,41 @@ def test_excel_through_engine(cfg,sample):
 def test_negative_mid_input_not_computable(cfg,sample):
     s=sample();s.legs[0].quote.bid=-1
     assert compute(cfg,s)['modes']['MID']['rawMean'] is None
+
+
+STRIKES=tuple(range(440,461))
+def test_atm_strike_exact_equal_adds_at(cfg,sample):
+    cfg.nBelow=5;cfg.nAbove=5
+    r=compute(cfg,sample(STRIKES,450))
+    rows=r['modes']['MID']['rows']; sides=[x['side'] for x in rows]
+    assert len(rows)==11 and (sides.count('below'),sides.count('at'),sides.count('above'))==(5,1,5)
+    assert r['composition']==['449','448','447','446','445','450','451','452','453','454','455']
+    a=r['modes']['MID']; assert a['requestedCount']==11 and a['computableCount']==11
+    at=[x for x in rows if x['side']=='at'][0]; assert at['strike']=='450' and a['atValue']==at['value']
+    assert a['belowMean']==pytest.approx(sum(x['value'] for x in rows if x['side']=='below')/5)
+    assert a['rawMean']==pytest.approx(sum(x['value'] for x in rows)/11)
+def test_atm_spot_between_strikes_unchanged(cfg,sample):
+    cfg.nBelow=5;cfg.nAbove=5
+    r=compute(cfg,sample(STRIKES,450.10))
+    rows=r['modes']['MID']['rows']
+    assert len(rows)==10 and 'at' not in {x['side'] for x in rows} and r['modes']['MID']['requestedCount']==10
+    assert r['composition']==['450','449','448','447','446','451','452','453','454','455']
+def test_atm_near_chain_edge(cfg,sample):
+    cfg.nBelow=5;cfg.nAbove=5
+    r=compute(cfg,sample((447,448,449,450,451,452),450))
+    sides=[x['side'] for x in r['modes']['MID']['rows']]
+    assert (sides.count('below'),sides.count('at'),sides.count('above'))==(3,1,2)
+    assert r['modes']['MID']['requestedCount']==11 and not r['modes']['MID']['strictEligible']
+@pytest.mark.parametrize('spot,has_at',[(450,True),(450.0,True),(Decimal('450.00'),True),(450.10,False),(449.99,False)])
+def test_atm_decimal_vs_float(spot,has_at):
+    cs=[Contract(id=f'{k}C',underlyingId='SPY',expiration='2026-10-19',strike=Decimal(k),right='C') for k in ('449.5','450','450.5')]
+    sides=[s for _,s in selected_strikes(cs,spot,1,1)]
+    assert ('at' in sides)==has_at and sides.count('below')==1 and sides.count('above')==1
+def test_atm_not_selected_when_counts_zero(cfg,sample):
+    cfg.nBelow=0;cfg.nAbove=0
+    r=compute(cfg,sample(STRIKES,450)); assert r['composition']==[] and r['status']=='PLEASE_SET_COUNTS'
+
+def test_atm_spot_450_01_is_not_at(cfg,sample):
+    cfg.nBelow=5;cfg.nAbove=5
+    rows=compute(cfg,sample(STRIKES,450.01))['modes']['MID']['rows']; sides=[x['side'] for x in rows]
+    assert len(rows)==10 and (sides.count('below'),sides.count('at'),sides.count('above'))==(5,0,5)
