@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from .models import Capabilities, Config, Contract, MarketState, Quote, Snapshot, Leg, utcnow
 from .instruments import FUTU_SYMBOLS
 from .engine import selected_strikes
-from .providers import ProviderError, regular_session
+from .providers import ProviderError, regular_session, exchange_day, live_expirations, target_expiry
 
 RIGHTS = {'LV1', 'LV2', 'LV3', 'LEVEL1', 'LEVEL2', 'LEVEL3'}
 SOURCE = 'Futu OpenD / US snapshots'
@@ -66,8 +66,9 @@ def vendor_error(data):
 
 
 class FutuProvider:
-    def __init__(self, context=None):
+    def __init__(self, context=None, clock=None):
         self.context = context
+        self.clock = clock or utcnow  # injectable for tests; decides today's exchange date
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='futu-quotes')
         self.lock = asyncio.Lock()
         self.pending = None
@@ -189,7 +190,8 @@ class FutuProvider:
     def expirations(self, cfg, check_permissions=True):
         if check_permissions: self.permissions()
         rows = self.call('get_option_expiration_date', code_for(cfg.underlyingId), ttl=1800)
-        return sorted(set(rows['strike_time'].tolist()))
+        # Futu may still list dates that already expired (cached for up to 30 min too); drop them.
+        return live_expirations(sorted(set(rows['strike_time'].tolist())), exchange_day(cfg, self.clock()))
 
     async def list_expirations(self, cfg):
         return await self.run(self.expirations, cfg)
@@ -242,9 +244,10 @@ class FutuProvider:
         catalogs, errors = {}, {}
         for mid, cfg in configs.items():
             try:
-                day = utcnow().astimezone(ZoneInfo(cfg.exchangeTimezone)).date().isoformat()
-                expiry = day if cfg.expiryMode == 'sameDay' else cfg.expiration
-                dates = self.expirations(cfg, check_permissions=False)
+                day = exchange_day(cfg, self.clock())
+                expiry = target_expiry(cfg, day)
+                # An expired manual expiration is never replaced: empty catalog -> engine status EXPIRED.
+                dates = live_expirations(self.expirations(cfg, check_permissions=False), day)
                 catalogs[mid] = self.contracts(cfg, expiry, check_permissions=False) if expiry in dates else []
             except ProviderError as e:
                 errors[mid] = e
@@ -272,7 +275,7 @@ class FutuProvider:
             try:
                 cfg = ready[mid]
                 quotes = self.map_option_quotes(cs, option_rows)
-                at = utcnow()
+                at = self.clock()
                 state = states.get(code_for(cfg.underlyingId), 'UNKNOWN')
                 snapshots[mid] = Snapshot(monitorId=mid, valuationAt=at, provider='futu',
                     underlying=anchors[mid], contracts=catalogs[mid],

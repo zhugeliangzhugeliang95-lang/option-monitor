@@ -113,6 +113,8 @@ def compute(cfg:Config,s:Snapshot):
         a.update(rawGapBps=10000*(a['rawMean']-ref)/ref if a['rawMean'] is not None and ref is not None and ref>0 else None,rows=rows,strictEligible=strict,dBps=10000*(a['validatedMean']-ref)/ref if strict else None,callBasis=cb,putBasis=pb,stockBasis=cfg.stockReferenceBasis)
         modes[mode]=a
     status='PLEASE_SET_COUNTS' if req==0 else ('NO_SAME_DAY_EXPIRY' if not catalog else ('MISSING_ANCHOR' if anchor is None else 'OK'))
+    # A fixed expiration before the valuation's exchange date is reported, never substituted.
+    if cfg.expiryMode!='sameDay' and expiry and expiry<localday and status in ('OK','NO_SAME_DAY_EXPIRY','MISSING_ANCHOR'): status='EXPIRED'
     if status=='OK' and anchor_errors: status='INVALID_SELECTION_ANCHOR'
     if status=='OK' and any('EXPIRED' in r['reasons'] for r in modes[cfg.optionPricePreset]['rows']): status='EXPIRED'
     if status=='OK' and s.provider=='manual': status='MANUAL_PRICE_ONLY'
