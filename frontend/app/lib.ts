@@ -8,4 +8,8 @@ export const fmt=(n:any,d=3)=>typeof n==='number'&&Number.isFinite(n)?n.toLocale
 export async function api(path:string,body?:unknown,method?:string){const r=await fetch('/api'+path,{method:method||(body?'POST':'GET'),headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const text=await r.text();let data:any;try{data=text?JSON.parse(text):null;}catch{throw new Error(`HTTP ${r.status} ${r.statusText||''}`.trim());}if(!r.ok)throw new Error(typeof data?.detail==='string'?data.detail:data?.detail!==undefined?JSON.stringify(data.detail):`HTTP ${r.status} ${r.statusText||''}`.trim());return data;}
 export const rowDefaults=()=>({strike:'152.5',call_bid:'6.52',call_ask:'6.72',call_last:'6.62',put_bid:'1.78',put_ask:'1.98',put_last:'1.88',call_reportedMid:'',put_reportedMid:''});
 export const NEW_MONITOR_STRIKES=5;
+// 与后端 MonitorConfig.nBelow/nAbove 一致：int, ge=0, le=50
+export const STRIKES_MIN=0,STRIKES_MAX=50;
+// 非负整数；空值或非数字回落到默认 5；小数向下取整；超范围夹到边界
+export const normStrikes=(v:unknown):number=>{const t=String(v??'').trim();const n=t===''?NaN:Number(t);if(!Number.isFinite(n))return NEW_MONITOR_STRIKES;return Math.min(STRIKES_MAX,Math.max(STRIKES_MIN,Math.floor(n)));};
 export const sideLabel=(side:unknown)=>side==='below'?'低于现价：Call价内 / Put价外':side==='at'?'现价（平值）：Call / Put 平值':'高于现价：Call价外 / Put价内';
