@@ -25,7 +25,7 @@ class Worker:
                 state=db.get(WorkerState,'singleton') or WorkerState(id='singleton',payload={})
                 state.payload={'heartbeatAt':nowstr(),'pid':os.getpid(),'targetSeconds':10}; db.add(state); db.commit()
             await asyncio.sleep(2)
-    async def collect(self,mid,rc,underlying=None,pre_error=None,prepared=None):
+    async def collect(self,mid,rc,underlying=None,pre_error=None,prepared=None,chain_meta=None):
         lock=self.locks.setdefault(mid,asyncio.Lock())
         if lock.locked(): return
         async with lock, self.semaphore:
@@ -52,7 +52,8 @@ class Worker:
                         options=state.optionSessionOpen and all(c.lastTradingAt and at<=c.lastTradingAt for c in selected)
                         snapshot=Snapshot(monitorId=mid,valuationAt=at,provider=cfg.provider,underlying=underlying,contracts=contracts,
                             legs=[Leg(contract=c,quote=quotes[c.id]) for c in selected if c.id in quotes],marketOpen=market,optionSessionOpen=options,marketReason=state.reason)
-                    with Session() as db: result=save_snapshot(db,snapshot,rc.id)
+                    with Session() as db: result=save_snapshot(db,snapshot,rc.id,extra={'chain':chain_meta} if chain_meta else None)
+                    if chain_meta: extra['chain']=chain_meta
                     status=result['status']; self.failures[mid]=0
             except (ProviderError,TimeoutError) as e:
                 operation=getattr(e,'operation',None)
@@ -87,8 +88,10 @@ class Worker:
                 for mid,rc in items:
                     await self.collect(mid,rc,pre_error=error)
                 return
+            meta=dict(getattr(self.providers['futu'],'chain_meta',None) or {})  # read right after the batch (one batch at a time)
             for mid, rc in items:
-                await self.collect(mid,rc,prepared=snapshots.get(mid),pre_error=errors.get(mid))
+                await self.collect(mid,rc,prepared=snapshots.get(mid),pre_error=errors.get(mid),
+                                   chain_meta=meta.get(mid) if snapshots.get(mid) is not None else None)
         finally:
             self.futu_inflight.difference_update(mid for mid,_ in items)
     async def futu_skip(self,items,operation):

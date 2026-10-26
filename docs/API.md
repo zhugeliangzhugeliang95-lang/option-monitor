@@ -60,6 +60,7 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 
 - **provider_status**：每个监测每轮写一行 `ProviderStatus`。`GET /api/providers/status` 返回它，设置页和历史页显示它。
 - **字段**：`status`、`operation`、`durationSeconds`、`retryAfter`、`delayed`、`at`，以及下表中的可选附加字段。
+- **聚合结果**：使用缓存（过期）期权链出数时，结果多一个 `chain` 键（见下）。
 - **原始快照**：不带这些状态字段，schema 不变。
 
 **"计入告警"的含义**：只是指状态显示为红色（失败），并在 worker 日志里写 WARNING/ERROR 行。本项目**没有任何通知渠道**，不会发邮件、推送或 webhook。
@@ -70,7 +71,8 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 | `OPEND_UNRESPONSIVE` | provider_status | 失败，固定 10 秒重试，不退避，不累计失败次数 | `operation`、`pendingSeconds`、`busyCycles` | `OPEND_UNRESPONSIVE` | OpenD 无响应：请求（{operation}）已卡住 {pendingSeconds} 秒，未重建连接，请检查 OpenD |
 | `TIMEOUT` | provider_status | 失败，指数退避 | `operation`（如 `get_market_snapshot`） | `TIMEOUT` | 富途请求超时（{operation}），稍后自动重试 |
 | `FUTU_BUSY` | provider_status | 非失败，10 秒重试 | `operation`=`busy`（上一请求未完成，带 `pendingSeconds`）或 `maintenance`（数据维护中） | `FUTU_BUSY` | 富途通道忙：上一请求尚未完成，本轮跳过 |
-| `CHAIN_WARMING` | provider_status | 非失败，10 秒重试 | `operation`=`get_option_chain`；`chain`={`state`:`warming`, `reason`:`queued`/`retrying`, `waitingSeconds`, `attempts`, `lastError`:{`code`, `ret`?, `at`}} | `CHAIN_WARMING` | 期权链加载中（已等待 {waitingSeconds} 秒），稍后出数 |
+| `CHAIN_WARMING` | provider_status | 非失败，10 秒重试 | `operation`=`get_option_chain`；`chain`={`state`:`warming`, `reason`:`queued`/`retrying`/`offHours`, `waitingSeconds`, `attempts`, `lastError`:{`code`, `ret`?, `at`}, `droppedReason`?:`MAX_AGE`} | `CHAIN_WARMING`；`reason=offHours` 用 `CHAIN_WARMING_OFF_HOURS` | 期权链加载中（已等待 {waitingSeconds} 秒），稍后出数；offHours：盘外，等待开盘前预热（约 09:00 美东） |
+| （正常出数，链为缓存） | provider_status 和聚合结果 | 非失败 | `chain`={`stale`, `ageSeconds`, `fetchedAt`, `refreshFailures`, `expirationsStale`}；链和到期日都新鲜时**不出现** | `CHAIN_STALE` | 使用 {ageSeconds} 秒前的期权链（后台刷新中）；`expirationsStale`：到期日列表为前一交易日 |
 | `CHAIN_UNAVAILABLE` | provider_status | 失败，固定 10 秒重试，不退避，不累计失败次数；按标的的拉链退避最长 300 秒 | 同 `CHAIN_WARMING`，`chain.state`=`unavailable` | `CHAIN_UNAVAILABLE` | 期权链长时间无法获取（错误码 {code}），请检查权限或 OpenD |
 
 **前端规则：**
@@ -85,4 +87,6 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 - `CHAIN_WARMING` 状态下，`chain.lastError` 只有错误码（如 `RATE_LIMITED`、`PERMISSION_DENIED`），以及富途返回的数字 `ret`（如有）和时间。不包含供应商原文。
 - `pendingSeconds` 是当前卡住的请求已持续的秒数（单进程、单调时钟）。
 - `busyCycles` 是连续遇到通道忙的批次数。
-- 第二个 PR 会增加 `chain.stale` / `chain.ageSeconds`（缓存链标记）和 `chain.reason=offHours`（盘外），届时更新本表。
+- `chain.reason=offHours`：预热窗口（交易日 `FUTU_PREWARM_START`～收盘后 15 分钟）之外的当天到期冷链。不计入 `CHAIN_UNAVAILABLE` 的等待上限，`waitingSeconds` 保持 0。
+- `chain.droppedReason=MAX_AGE`：缓存链超过最大年龄（当天到期 `FUTU_CHAIN_MAX_AGE` 默认 5400 秒，远期 4 天）被丢弃，按最高优先级重拉。
+- `chain.stale` 等元数据只在 provider_status 和聚合结果的 `chain` 键里，不进入原始快照。

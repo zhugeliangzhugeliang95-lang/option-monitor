@@ -71,3 +71,22 @@ def test_effective_config_logged_once_without_secrets(caplog, monkeypatch):
         assert len(logged) == 1 and 'hot_budget=6.0' in logged[0]
     finally:
         monkeypatch.delenv('FUTU_HOT_BUDGET'); futu_config.settings.cache_clear()
+
+
+# --- PR 2: SWR / max age / pre-warm start (sections c, F) ---------------------------------
+def test_pr2_defaults():
+    s = load({})
+    assert (s.swr, s.max_age, s.max_age_future, s.prewarm_start) == (1, 5400.0, 345600.0, (9, 0))
+
+
+@pytest.mark.parametrize('env,field,value,warned', [
+    ({'FUTU_CHAIN_SWR': '0'}, 'swr', 0, False), ({'FUTU_CHAIN_SWR': '2'}, 'swr', 1, True),
+    ({'FUTU_CHAIN_SWR': 'yes'}, 'swr', 1, True),
+    ({'FUTU_CHAIN_MAX_AGE': '2400'}, 'max_age', 5400.0, True), ({'FUTU_CHAIN_MAX_AGE': '3600'}, 'max_age', 3600.0, False),
+    ({'FUTU_CHAIN_MAX_AGE_FUTURE': '2400'}, 'max_age_future', 345600.0, True),
+    ({'FUTU_PREWARM_START': '08:15'}, 'prewarm_start', (8, 15), False), ({'FUTU_PREWARM_START': '09:25'}, 'prewarm_start', (9, 25), False),
+    ({'FUTU_PREWARM_START': '08:14'}, 'prewarm_start', (9, 0), True), ({'FUTU_PREWARM_START': '09:26'}, 'prewarm_start', (9, 0), True),
+    ({'FUTU_PREWARM_START': '9am'}, 'prewarm_start', (9, 0), True)])
+def test_pr2_ranges(caplog, env, field, value, warned):
+    assert getattr(load(env), field) == value
+    assert bool(warnings(caplog)) == warned
