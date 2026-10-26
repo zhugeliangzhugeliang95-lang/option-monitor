@@ -12,6 +12,7 @@ from .engine import compute, BASES
 from .service import config_for, create_monitor, revise, save_snapshot, statistics_for, summary_columns, summary_row
 from .providers import provider_for, ProviderError
 from .imports import parse_import
+from . import models
 
 LOCAL_ORIGINS=[f'http://127.0.0.1:{os.getenv("FRONTEND_PORT","3000")}',f'http://localhost:{os.getenv("FRONTEND_PORT","3000")}',f'http://127.0.0.1:{os.getenv("BACKEND_PORT","8000")}']
 subscribers=set()
@@ -128,6 +129,10 @@ def latest(summary:bool=False):
             if payload:
                 st=db.scalar(select(StatisticalResult).where(StatisticalResult.monitor_id==m.id,StatisticalResult.config_id==m.config_id).order_by(StatisticalResult.id.desc()).limit(1))
                 out[m.id]={**payload,'oldConfiguration':config_id!=m.config_id,'statistics':st.payload if st else None}
+                if not summary:
+                    # Additive display hint (freshness): from the config that produced this result.
+                    rc=db.get(RunConfig,config_id); max_age=(rc.payload if rc else {}).get('maxAgeSeconds',Config.model_fields['maxAgeSeconds'].default)
+                    out[m.id]['staleAfterSeconds']=models.staleness_seconds(max_age)
         return out
 @app.get('/api/monitors/{mid}/history')
 def history(mid:str,limit:int=200,before:int|None=None,after:int|None=None,summary:bool=False):
@@ -168,7 +173,7 @@ def status():
             rc=db.get(RunConfig,m.config_id)
             out[m.id]={'status':'PAUSED'} if not rc.payload.get('collectionEnabled',True) else (row.payload if row else {'status':'MANUAL_INPUT_REQUIRED' if rc.payload['provider']=='manual' else 'WAITING_WORKER'})
         age=(utcnow()-datetime.fromisoformat(worker['heartbeatAt'])).total_seconds() if worker else None
-        return {'worker':worker,'workerStatus':'RUNNING' if age is not None and age<8 else 'INTERRUPTED','monitors':out}
+        return {'cycleSeconds':models.CYCLE_SECONDS,'worker':worker,'workerStatus':'RUNNING' if age is not None and age<8 else 'INTERRUPTED','monitors':out}
 @app.post('/api/providers/test')
 async def test_provider(body:dict):
     name=body.get('provider','http')
