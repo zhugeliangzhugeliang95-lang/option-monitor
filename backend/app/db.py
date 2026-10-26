@@ -6,10 +6,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 ROOT=Path(__file__).resolve().parents[2]
 DB_PATH=Path(os.getenv('DATABASE_PATH',str(ROOT/'data/monitor.sqlite3')))
 DB_PATH.parent.mkdir(parents=True,exist_ok=True)
+# WAL never shrinks after a checkpoint on its own; cap what stays on disk (docs/API.md, 存储).
+JOURNAL_SIZE_LIMIT=64*1024*1024
 engine=create_engine('sqlite:///'+str(DB_PATH),connect_args={'timeout':15})
 @event.listens_for(engine,'connect')
 def pragmas(connection,_):
-    connection.execute('PRAGMA journal_mode=WAL'); connection.execute('PRAGMA busy_timeout=15000'); connection.execute('PRAGMA foreign_keys=ON')
+    connection.execute('PRAGMA journal_mode=WAL'); connection.execute('PRAGMA busy_timeout=15000'); connection.execute('PRAGMA foreign_keys=ON'); connection.execute(f'PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT}')
 Session=sessionmaker(engine,expire_on_commit=False)
 class Base(DeclarativeBase): pass
 class Monitor(Base):

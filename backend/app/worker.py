@@ -9,6 +9,7 @@ from .providers import provider_for, ProviderError, regular_session, exchange_da
 from .service import save_snapshot, persist_statistics
 from . import retention
 from . import futu_config
+from . import models
 from .logs import configure as configure_logging
 log=logging.getLogger('app.worker')
 # Plan item 1, section E: statuses that are not failures (no failure count, no backoff, retry 10 s)
@@ -24,7 +25,7 @@ class Worker:
         while self.running:
             with Session() as db:
                 state=db.get(WorkerState,'singleton') or WorkerState(id='singleton',payload={})
-                state.payload={'heartbeatAt':nowstr(),'pid':os.getpid(),'targetSeconds':10}; db.add(state); db.commit()
+                state.payload={'heartbeatAt':nowstr(),'pid':os.getpid(),'targetSeconds':models.CYCLE_SECONDS}; db.add(state); db.commit()
             await asyncio.sleep(2)
     async def collect(self,mid,rc,underlying=None,pre_error=None,prepared=None,chain_meta=None):
         lock=self.locks.setdefault(mid,asyncio.Lock())
@@ -76,7 +77,7 @@ class Worker:
                     mid,cfg.provider,cfg.underlyingId,time.monotonic()-started,self.failures[mid])
             duration=time.monotonic()-started
             if duration>=10: log.warning('slow collect monitor=%s symbol=%s status=%s duration=%.3fs',mid,cfg.underlyingId,status,duration)
-            self.next_due[mid]=time.monotonic()+max(10-(time.time()%10),retry)
+            self.next_due[mid]=time.monotonic()+max(models.CYCLE_SECONDS-(time.time()%models.CYCLE_SECONDS),retry)
             with Session() as db:
                 db.add(record(ProviderStatus,mid,rc.id,{'status':status,'operation':operation,'durationSeconds':duration,'retryAfter':retry,'delayed':duration>=10 or retry>0,'at':nowstr(),**extra}))
                 db.add(ResultOutbox(payload={'type':'provider','monitorId':mid,'status':status},created_at=nowstr())); db.commit()
@@ -98,7 +99,7 @@ class Worker:
                 for mid,rc in items:
                     await self.collect(mid,rc,pre_error=error)
                 return
-            meta=dict(getattr(self.providers['futu'],'chain_meta',None) or {})  # read right after the batch (one batch at a time)
+            meta=dict(getattr(self.providers['futu'],'chain_meta',None) or {})  # read right after the batch, no await in between; FutuProvider runs one batch at a time
             for mid, rc in items:
                 await self.collect(mid,rc,prepared=snapshots.get(mid),pre_error=errors.get(mid),
                                    chain_meta=meta.get(mid) if snapshots.get(mid) is not None else None)
@@ -107,10 +108,20 @@ class Worker:
     async def futu_skip(self,items,operation):
         error=ProviderError('FUTU_BUSY',10); error.operation=operation
         await asyncio.gather(*(self.collect(mid,rc,pre_error=error) for mid,rc in items))
+    PER_MONITOR=('locks','next_due','failures','last_status')
+    def prune(self,active):
+        """Drop per-monitor state of deleted/inactive monitors (deletion only sets active=False, ids are uuid4 per create).
+        Never prunes a monitor still in flight: in a futu batch (futu_inflight) or holding its collect lock."""
+        busy=set(self.futu_inflight)|{mid for mid,lock in self.locks.items() if lock.locked()}
+        for name in self.PER_MONITOR:
+            d=getattr(self,name)
+            for mid in [k for k in d if k not in active and k not in busy]: del d[mid]
     async def cycle(self):
         due=[]
         with Session() as db:
-            for m in db.scalars(select(Monitor).where(Monitor.active==True)):
+            monitors=list(db.scalars(select(Monitor).where(Monitor.active==True)))
+            self.prune({m.id for m in monitors})
+            for m in monitors:
                 rc=db.get(RunConfig,m.config_id)
                 if rc.payload['provider']=='manual' or not rc.payload.get('collectionEnabled',True): continue
                 if m.id in self.futu_inflight: continue  # its batch is still running in the background

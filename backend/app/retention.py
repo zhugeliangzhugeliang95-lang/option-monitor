@@ -64,9 +64,13 @@ def cleanup(conn:sqlite3.Connection,now=None,days=None,zone=None,batch=BATCH):
     log.info('retention done boundary=%s deleted=%s counts_after=%s duration=%.3fs',cut,deleted,after,duration)
     return summary
 
-def run_on_path(path,now=None):
+def run_on_path(path,now=None,journal_size_limit=None):
     # Dedicated connection so pooled SQLAlchemy connections keep their transaction settings.
+    # Same journal_size_limit as db.pragmas: the batched deletes are the largest transactions we write.
+    if journal_size_limit is None:
+        from .db import JOURNAL_SIZE_LIMIT as journal_size_limit
     conn=sqlite3.connect(str(path),timeout=15)
     try:
-        conn.execute('PRAGMA busy_timeout=15000'); return cleanup(conn,now)
+        conn.execute('PRAGMA busy_timeout=15000'); conn.execute(f'PRAGMA journal_size_limit={int(journal_size_limit)}')
+        return cleanup(conn,now)
     finally: conn.close()

@@ -21,6 +21,16 @@ def check_symbol(value,field='symbol'):
         raise ValueError(f'标的代码格式无效：只允许字母、数字和 . - _，以字母或数字开头，最长 {SYMBOL_MAX} 个字符 / '
                          f'Invalid {field} {v[:40]!r}: use letters, digits, ".", "-", "_" (start with a letter or digit, max {SYMBOL_MAX} chars)')
     return v
+# Worker target cycle (seconds): single source for the heartbeat targetSeconds, the worker's
+# 10 s slot schedule and the API's cycleSeconds / staleAfterSeconds.
+CYCLE_SECONDS = 10
+
+def staleness_seconds(max_age_seconds, cycle_seconds=None):
+    """Read-only display hint: max(maxAgeSeconds, 2 x cycle), rounded up to an int."""
+    import math
+    cycle = CYCLE_SECONDS if cycle_seconds is None else cycle_seconds
+    return int(math.ceil(max(float(max_age_seconds), 2 * cycle)))
+
 def utcnow(): return datetime.now(timezone.utc)
 class Model(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)

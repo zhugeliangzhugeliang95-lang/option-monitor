@@ -29,6 +29,27 @@
 | GET /api/exports/{monitorId} | 完整JSON审计，包括所有配置、快照、结果、分钟、统计、冻结和追加结果 |
 | GET /api/exports/{monitorId}?format=csv | 每个快照、每个口径各一行，含口径与配置hash |
 
+### 新鲜度字段 / Freshness fields（只读，纯加法）
+
+| JSON 路径 | 类型 | 是否总是存在 | 含义 |
+|---|---|---|---|
+| `GET /api/providers/status` → `cycleSeconds` | 整数 | 总是存在（即使没有 worker 心跳，`worker` 为 `null` 时也返回） | worker 目标采集周期（秒）。与心跳 `worker.targetSeconds` 同一来源（`app/models.py` 的 `CYCLE_SECONDS`，当前 10），不读取心跳；无心跳时即该默认值 |
+| `GET /api/results/latest` → `<monitorId>.staleAfterSeconds` | 整数 | 有结果的监测总是存在；`?summary=1` 响应中不出现 | `ceil(max(maxAgeSeconds, 2 × cycleSeconds))`；`maxAgeSeconds` 取产生该结果的配置版本（旧配置结果用旧配置）。默认 maxAgeSeconds=5 时为 20 |
+
+仅供前端判断「历史 / 过旧快照」的显示阈值；不改变 `maxAgeSeconds` 本身、报价质量判定、config hash/configId 或统计窗口。`/api/monitors/{id}/history`、`/api/snapshots/{id}`、`summary=1` 不变。旧前端可忽略；新前端缺字段时回退 `max(maxAgeSeconds, 20)`。
+
+真实运行示例（临时库、MOCK、`python -m app.worker` 实跑；SPY 监测 maxAgeSeconds=5，节选字段）：
+
+```json
+// GET /api/providers/status（节选）
+{"cycleSeconds": 10, "worker": {"heartbeatAt": "2026-10-26T12:15:07.645730+00:00", "pid": 280497, "targetSeconds": 10}, "workerStatus": "RUNNING", "monitors": {...}}
+
+// GET /api/results/latest（节选）
+{"9263556b78f1423d99402abf85f44069": {"valuationAt": "2026-10-26T12:15:00.041056+00:00", "status": "OK", "anchorStrictEligible": true, "staleAfterSeconds": 20, ...}}
+```
+
+无 worker 心跳时：`{"cycleSeconds": 10, "worker": null, "workerStatus": "INTERRUPTED", ...}`；maxAgeSeconds=30 的监测 `staleAfterSeconds` 为 30。
+
 ### 统计诊断字段 / Statistics diagnostic fields
 
 `GET /api/monitors/{id}/statistics`（以及统计SSE/持久化的StatisticalResult）新增以下**只增不改**字段；统计方法与严格资格规则不变。旧版本持久化的结果可能没有这些字段，客户端应视为可选。
@@ -80,6 +101,8 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 ## 存储
 
 单一SQLAlchemy ORM管理SQLite。WAL、busy_timeout=15000ms。RunConfig/RawSnapshot/PairResult/AggregateResult/MinuteBlock/StatisticalResult/FrozenObservation/ObservationOutcome有禁止UPDATE/DELETE触发器。Monitor、WorkerState属于可变控制状态，ProviderStatus和Outbox追加。
+
+所有连接（`db.pragmas` 连接监听器，以及 `retention.run_on_path` 自己的 sqlite3 连接）都设置 `PRAGMA journal_size_limit=67108864`（64 MB）。原因：WAL 文件在 checkpoint 后不会自动缩小，其大小由历史上最大的一次事务决定；实测一次保留清理批次（删除 2000 行）就把 WAL 从约 4.2 MB（默认 1000 页自动 checkpoint）撑到 18.4 MB 并一直保持。设置上限后，每次 checkpoint 完成、WAL 重置时会被截断到上限以内。64 MB 远高于正常约 4 MB 的水位，不影响日常写入，但能防止一次异常大事务后磁盘被长期占用。如需立即回收，仍按 `retention.py` 文档在停机后手动执行 `PRAGMA wal_checkpoint(TRUNCATE)`。
 
 分钟块按统计批次保存不可变修订快照；同一个分钟可出现在多次统计批次中，其statsAsOf可区分，不能将这些审计修订当额外样本。worker在保存结果的同一事务写outbox，API负责广播。worker文件锁与数据库路径绑定，第二个worker启动会拒绝。
 
@@ -152,7 +175,7 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 | `chain.stale` | bool（链已过新鲜 TTL、按 SWR 出数时为 true） | 总有 |
 | `chain.ageSeconds` | int（距 `fetchedAt` 的秒数） | 总有 |
 | `chain.fetchedAt` | ISO 8601 string（UTC） | 总有 |
-| `chain.refreshFailures` | int（后台刷新连续失败次数） | 总有 |
+| `chain.refreshFailures` | int（后台刷新连续失败次数，含本批次的刷新结果：本批刷新失败则已 +1，本批刷新成功则为 0） | 总有 |
 | `chain.expirationsStale` | bool（到期日列表为前一交易日） | 总有 |
 
 注意：可能出现 `stale=false` 且 `expirationsStale=true`（链新鲜、到期日列表旧）。

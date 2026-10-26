@@ -8,6 +8,13 @@ export const reasonLabels:Record<string,string>={NO_DATA:'暂无数据：当前�
 export const reasonText=(r:unknown):string=>{if(r==null||r==='')return '';if(typeof r==='string')return r==='OK'?'':reasonLabels[r]||r;if(typeof r==='object'){const o=r as {code?:unknown;message?:unknown};const code=typeof o.code==='string'?o.code:'';if(code==='OK')return '';if(code&&reasonLabels[code])return reasonLabels[code];if(typeof o.message==='string'&&o.message)return o.message;return code;}return '';};
 const isNum=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v);
 export const numOr=(v:unknown,d:number)=>isNum(v)?v:d;
+/** 「过旧快照」阈值（秒）。优先结果里的 staleAfterSeconds（后端 = max(maxAgeSeconds, 2×cycleSeconds)）；
+ *  缺失时用 max(maxAgeSeconds, 2×cycleSeconds)（/api/providers/status 顶层 cycleSeconds）；再缺失回退 max(maxAgeSeconds, 20)。 */
+export const DEFAULT_CYCLE_SECONDS=10;
+export function staleAfterSeconds(result:unknown,maxAgeSeconds:unknown,cycleSeconds?:unknown):number{
+ const s=(result as {staleAfterSeconds?:unknown}|null|undefined)?.staleAfterSeconds;if(isNum(s)&&s>0)return s;
+ const cyc=isNum(cycleSeconds)&&cycleSeconds>0?cycleSeconds:DEFAULT_CYCLE_SECONDS;return Math.max(numOr(maxAgeSeconds,0),2*cyc);}
+export const isStaleAt=(at:unknown,nowMs:number,threshold:number)=>{if(typeof at!=='string'||!at)return false;const t=Date.parse(at);return Number.isFinite(t)&&(nowMs-t)/1000>threshold;};
 export {isNum};
 export const focusSymbols=['TSLA','NVDA','META','AMZN','GOOGL','AAPL','MSFT'];
 export const focusRank=(m:Obj)=>{const rank=focusSymbols.indexOf(m.config.symbol);return rank<0?focusSymbols.length:rank;};
