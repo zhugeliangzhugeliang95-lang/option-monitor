@@ -47,3 +47,78 @@
 限频依据：[期权链](https://openapi.futunn.com/futu-api-doc/quote/get-option-chain.html)、[市场状态](https://openapi.futunn.com/futu-api-doc/quote/get-market-state.html)、[市场快照](https://openapi.futunn.com/futu-api-doc/en/quote/get-market-snapshot.html)。
 
 用户追加 SOXX 后核验到最近到期日为2026-10-23，12个期权买卖报价完整；与其他标的一样使用显式研究定价假设。
+
+## 超时、预热与状态（item 1，第一部分）
+
+一批富途采集在后台任务里运行，不阻塞 mock/http 监测。
+
+### 预算
+
+- **SDK 线程内的协作截止时间**：`FUTU_HOT_BUDGET`，默认 7 秒。
+  - 每次真实调用前，检查"已用时间 + 该方法余量"是否超过预算；超过就不发起这次调用。
+  - 余量默认值：
+    - `get_user_info` 2.0
+    - `get_global_state` 0.5
+    - `get_option_expiration_date` 1.0
+    - `get_option_chain` 1.0
+    - `get_market_state` 0.5
+    - `get_market_snapshot` 0.75
+  - 每项可用 `FUTU_HEADROOM_*` 覆盖。
+- **整批超时**：`FUTU_BATCH_TIMEOUT`，默认 9 秒，必须大于 HOT_BUDGET。
+- 已经在执行的 SDK 调用不会被打断：同一时刻只有一个 OpenD 调用。
+
+### 先报价，后预热
+
+- 每批先给"链已缓存"的监测报价：市场状态 1 次，快照 2 次。
+- 剩余预算最多拉 `FUTU_CHAIN_WARM_PER_CYCLE` 条期权链：
+  - 默认 1。
+  - 上限由预算和每窗 8 次限频推出，当前为 2。超过上限时截断，并记 WARNING。
+  - 若期权链窗口已有 8 次调用，本批停止拉链。
+- 拉链顺序：
+  1. 今天到期的冷链；
+  2. 即将到期的已缓存链（提前 300 秒刷新）；
+  3. 其他冷链。
+  - 同一类按等待时间先后排，再按代码排。
+- 之后为后面最多 3 个排队标的预取到期日。
+- 新拉好的链在下一批出数。
+- 链的 TTL 为 1800 秒，加按代码确定的 0–599 秒错开量。
+- 本 PR 不提供过期缓存：到期前提前刷新，所以正常运行时没有 `CHAIN_WARMING` 空档。
+
+### 卡死升级（E.1，`FUTU_WATCHDOG=0`，不重建连接）
+
+上一请求仍在执行时，新批次得到 `FUTU_BUSY`。满足以下任一条件后，改为 `OPEND_UNRESPONSIVE`：
+
+- 该请求已超过 `FUTU_HANG_SECONDS`（默认 60，范围 20–600，必须大于 BATCH_TIMEOUT）；
+- 连续 `FUTU_BUSY_ALERT_CYCLES` 批（默认 6，范围 2–60）都遇到通道忙。
+
+按 10 秒节奏，只有当 `FUTU_HANG_SECONDS > FUTU_BUSY_ALERT_CYCLES×10+9` 时，连续批次条件才会先于时长条件触发。默认值（60, 6）下两者在约 60 秒同时触发。
+
+日志：
+
+- 进入该状态时记 WARNING 一次；
+- 卡住达到 5×HANG 秒时记 ERROR，之后每 5×HANG 秒再记一次；
+- 请求返回后记 INFO，带卡住时长。
+
+提示：卡住后的第一批返回 `TIMEOUT`，worker 的失败次数记 1，直到下一次成功才清零（下一次失败的退避从这里起算）。这是预期行为。
+
+日志不含参数和账号信息。不发送任何通知。
+
+### 期权链长期失败（E.2）
+
+- 拉链失败时，状态仍为 `CHAIN_WARMING`（`reason=retrying`），并带 `lastError.code`。
+- 同一标的的重试退避为 10、20、40… 秒，最长 300 秒。
+- 从开始等待算起超过 `FUTU_CHAIN_WARM_MAX_SECONDS`（默认 600，范围 120–3600）且至少失败一次时，状态变为 `CHAIN_UNAVAILABLE`，并记 WARNING 一次。
+- 上限的计时起点是该链**进入预热队列**的时刻，不是第一次失败的时刻。例如排队 590 秒后第一次失败，再过约 10 秒就会变为 `CHAIN_UNAVAILABLE`。
+- **过渡行为（#18 合并前）**：本 PR 没有盘外时段的概念，夜间或周末拉链持续失败超过上限时也会变红（`CHAIN_UNAVAILABLE`）。#18 合并后，预热窗口外的当天链显示 `CHAIN_WARMING`（`reason=offHours`），不计入该上限。
+- 恢复后记 INFO。
+
+### 数据保留与停止
+
+- **每日保留清理**：期间不启动新的富途批次，到期监测显示 `FUTU_BUSY`（`operation=maintenance`）。清理会先等待正在运行的批次（最多 BATCH_TIMEOUT），超过 `FUTU_MAINT_ALERT_SECONDS`（默认 300）记 WARNING。
+- **停止顺序**：
+  1. 取消并等待富途批次；
+  2. 停心跳；
+  3. 等待在途请求，最多 `FUTU_CLOSE_WAIT`（默认 10）秒，然后在 SDK 线程里关闭上下文。仍卡住时记 ERROR、不关闭上下文，停止流程照常完成；
+  4. 关闭其他 provider。
+
+非法环境变量回退默认值，并记 WARNING。生效配置在启动时以 INFO 记录一次。状态表见 `docs/API.md` 的"Futu 用户可见状态（前端契约）"。

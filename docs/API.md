@@ -82,3 +82,36 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 单一SQLAlchemy ORM管理SQLite。WAL、busy_timeout=15000ms。RunConfig/RawSnapshot/PairResult/AggregateResult/MinuteBlock/StatisticalResult/FrozenObservation/ObservationOutcome有禁止UPDATE/DELETE触发器。Monitor、WorkerState属于可变控制状态，ProviderStatus和Outbox追加。
 
 分钟块按统计批次保存不可变修订快照；同一个分钟可出现在多次统计批次中，其statsAsOf可区分，不能将这些审计修订当额外样本。worker在保存结果的同一事务写outbox，API负责广播。worker文件锁与数据库路径绑定，第二个worker启动会拒绝。
+
+## Futu 用户可见状态（前端契约）
+
+富途 worker 的状态从三个地方读出：
+
+- **provider_status**：每个监测每轮写一行 `ProviderStatus`。`GET /api/providers/status` 返回它，设置页和历史页显示它。
+- **字段**：`status`、`operation`、`durationSeconds`、`retryAfter`、`delayed`、`at`，以及下表中的可选附加字段。
+- **原始快照**：不带这些状态字段，schema 不变。
+
+**"计入告警"的含义**：只是指状态显示为红色（失败），并在 worker 日志里写 WARNING/ERROR 行。本项目**没有任何通知渠道**，不会发邮件、推送或 webhook。
+
+| 状态 | 出现位置 | 类别 | 附加字段 | 前端文案 key | 前端文案（建议） |
+|---|---|---|---|---|---|
+| `OPEND_OFFLINE` | provider_status | 失败，指数退避 | `operation`（可能为空） | `OPEND_OFFLINE` | OpenD 未启动或无法连接 |
+| `OPEND_UNRESPONSIVE` | provider_status | 失败，固定 10 秒重试，不退避，不累计失败次数 | `operation`、`pendingSeconds`、`busyCycles` | `OPEND_UNRESPONSIVE` | OpenD 无响应：请求（{operation}）已卡住 {pendingSeconds} 秒，未重建连接，请检查 OpenD |
+| `TIMEOUT` | provider_status | 失败，指数退避 | `operation`（如 `get_market_snapshot`） | `TIMEOUT` | 富途请求超时（{operation}），稍后自动重试 |
+| `FUTU_BUSY` | provider_status | 非失败，10 秒重试 | `operation`=`busy`（上一请求未完成，带 `pendingSeconds`）或 `maintenance`（数据维护中） | `FUTU_BUSY` | 富途通道忙：上一请求尚未完成，本轮跳过 |
+| `CHAIN_WARMING` | provider_status | 非失败，10 秒重试 | `operation`=`get_option_chain`；`chain`={`state`:`warming`, `reason`:`queued`/`retrying`, `waitingSeconds`, `attempts`, `lastError`:{`code`, `ret`?, `at`}} | `CHAIN_WARMING` | 期权链加载中（已等待 {waitingSeconds} 秒），稍后出数 |
+| `CHAIN_UNAVAILABLE` | provider_status | 失败，固定 10 秒重试，不退避，不累计失败次数；按标的的拉链退避最长 300 秒 | 同 `CHAIN_WARMING`，`chain.state`=`unavailable` | `CHAIN_UNAVAILABLE` | 期权链长时间无法获取（错误码 {code}），请检查权限或 OpenD |
+
+**前端规则：**
+
+- 按 `status` 选文案。
+- `{operation}`、`{pendingSeconds}`、`{waitingSeconds}`、`{code}`（取 `chain.lastError.code`）从字段填入。字段缺失就省略对应括号。
+- 文案中不写死秒数或端口：阈值来自环境变量，见 `docs/FUTU.md`。
+- 未知状态继续回退为显示原文。
+
+**说明：**
+
+- `CHAIN_WARMING` 状态下，`chain.lastError` 只有错误码（如 `RATE_LIMITED`、`PERMISSION_DENIED`），以及富途返回的数字 `ret`（如有）和时间。不包含供应商原文。
+- `pendingSeconds` 是当前卡住的请求已持续的秒数（单进程、单调时钟）。
+- `busyCycles` 是连续遇到通道忙的批次数。
+- 第二个 PR 会增加 `chain.stale` / `chain.ageSeconds`（缓存链标记）和 `chain.reason=offHours`（盘外），届时更新本表。

@@ -8,16 +8,56 @@ from decimal import Decimal
 import math
 import os
 import socket
+import logging
 import time
+import zlib
 from zoneinfo import ZoneInfo
 
 from .models import Capabilities, Config, Contract, MarketState, Quote, Snapshot, Leg, utcnow
 from .instruments import FUTU_SYMBOLS
 from .engine import selected_strikes
 from .providers import ProviderError, regular_session, exchange_day, live_expirations, target_expiry
+from . import futu_config
+
+log = logging.getLogger('app.futu')
 
 RIGHTS = {'LV1', 'LV2', 'LV3', 'LEVEL1', 'LEVEL2', 'LEVEL3'}
 SOURCE = 'Futu OpenD / US snapshots'
+WINDOW = 30.1            # seconds, internal limiter window
+CHAIN_TTL = 1800         # base fresh TTL for chains and expirations
+STAGGER = 600            # per-symbol TTL offset range [0, 600)
+REFRESH_LEAD = 300       # refresh a fresh chain this long before its TTL ends (no stale serving in PR 1)
+PREFETCH_PER_BATCH = 3   # expiration prefetches per batch
+
+
+class DeadlineReached(Exception):
+    """Internal: the next SDK call would not finish inside the batch budget; it was not started."""
+    def __init__(self, method):
+        self.method = method
+        super().__init__(method)
+
+
+def timeout_error(method):
+    e = ProviderError('TIMEOUT')
+    e.operation = method
+    return e
+
+
+def stagger(code):
+    """Deterministic per-symbol TTL offset in [0, STAGGER)."""
+    return zlib.crc32(code.encode()) % STAGGER
+
+
+class WarmState:
+    __slots__ = ('since', 'waiting', 'attempts', 'last_error', 'next_try', 'warned')
+
+    def __init__(self, since, waiting):
+        self.since = since            # wall clock, first time a monitor found nothing servable
+        self.waiting = waiting        # monotonic, round-robin position
+        self.attempts = 0
+        self.last_error = None        # {'code', 'at'} (+ 'ret' if Futu returned one); never message text
+        self.next_try = 0.0
+        self.warned = False
 
 
 def code_for(symbol):
@@ -66,22 +106,76 @@ def vendor_error(data):
 
 
 class FutuProvider:
-    def __init__(self, context=None, clock=None):
+    def __init__(self, context=None, clock=None, mono=None, settings=None):
         self.context = context
         self.clock = clock or utcnow  # injectable for tests; decides today's exchange date
+        self.mono = mono or time.monotonic  # injectable for tests; limiter, deadline, TTL, hang detection
+        self.settings = settings or futu_config.settings()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='futu-quotes')
         self.lock = asyncio.Lock()
         self.pending = None
         self.cache = {}
         self.calls = defaultdict(deque)
+        self.deadline = None
+        # E.1 hang / busy escalation state (per process, status only)
+        self.pending_since = 0.0
+        self.pending_fn = None
+        self.current_method = None
+        self.busy_streak = 0
+        self.unresponsive_since = None
+        self.next_error_at = 0.0
+        # Chain warm cache (section A): key (code, expiry)
+        self.chains = {}       # key -> {'contracts', 'fetched', 'expires'}
+        self.dates = {}        # code -> {'dates', 'fetched', 'expires'}
+        self.warm = {}         # key -> WarmState
+        self.refresh_next = {} # key -> monotonic time of next refresh-ahead attempt
 
     async def run(self, fn, *args):
         async with self.lock:
             if self.pending is not None and not self.pending.done():
-                raise ProviderError('FUTU_BUSY', 10)
+                raise self.busy_error()
+            self.busy_streak = 0
+            self.current_method = None
+            self.pending_fn = getattr(fn, '__name__', 'call')
+            self.pending_since = self.mono()
             self.pending = asyncio.get_running_loop().run_in_executor(self.executor, fn, *args)
+            self.pending.add_done_callback(self.pending_done)
             # Worker cancellation never starts a second SDK call on top of the first.
             return await asyncio.shield(self.pending)
+
+    def busy_error(self):
+        """FUTU_BUSY, or OPEND_UNRESPONSIVE once the pending call is hung (E.1). Never rebuilds anything."""
+        s = self.settings
+        now = self.mono()
+        pending = now - self.pending_since
+        self.busy_streak += 1
+        op = self.current_method or self.pending_fn or 'unknown'
+        if pending <= s.hang_seconds and self.busy_streak < s.busy_alert_cycles:
+            e = ProviderError('FUTU_BUSY', 10)
+            e.operation = 'busy'
+            e.pending_seconds = round(pending, 1)
+            return e
+        if self.unresponsive_since is None:
+            self.unresponsive_since = self.pending_since
+            self.next_error_at = self.pending_since + 5 * s.hang_seconds
+            log.warning('futu call %s pending %ds (limit %ds, %d busy cycles), status OPEND_UNRESPONSIVE, '
+                        'connection not rebuilt (FUTU_WATCHDOG=0)', op, pending, s.hang_seconds, self.busy_streak)
+        if now >= self.next_error_at:
+            log.error('futu call %s still pending after %ds, OpenD unresponsive, connection not rebuilt', op, pending)
+            self.next_error_at = now + 5 * s.hang_seconds
+        e = ProviderError('OPEND_UNRESPONSIVE', 10)
+        e.operation = op
+        e.pending_seconds = round(pending, 1)
+        e.busy_cycles = self.busy_streak
+        return e
+
+    def pending_done(self, fut):
+        if not fut.cancelled():
+            fut.exception()  # mark retrieved; a late result is discarded
+        if self.unresponsive_since is not None:
+            log.info('futu call %s returned after %ds, OPEND_UNRESPONSIVE cleared',
+                     self.current_method or self.pending_fn, self.mono() - self.unresponsive_since)
+            self.unresponsive_since = None
 
     def connect(self):
         if self.context is not None:
@@ -105,27 +199,40 @@ class FutuProvider:
     def call(self, method, *args, ttl=0, **kwargs):
         self.connect()
         key = (method, repr(args), repr(kwargs))
-        now = time.monotonic()
+        now = self.mono()
         cached = self.cache.get(key)
         if cached and cached[0] > now:
             return cached[1]
+        # Cooperative deadline (section A): never start a call that cannot finish inside the budget.
+        if self.deadline is not None and now + self.settings.room(method) > self.deadline:
+            raise DeadlineReached(method)
         # Reserve margin beneath documented per-30s limits; all monitors share this provider.
-        limit = 8 if method in ('get_option_chain', 'get_market_state') else 50
+        limit = futu_config.CHAIN_LIMIT if method in ('get_option_chain', 'get_market_state') else 50
         window = self.calls[method]
-        while window and window[0] < now - 30.1:
+        while window and window[0] < now - WINDOW:
             window.popleft()
         if len(window) >= limit:
-            raise ProviderError('RATE_LIMITED', 30.1 - (now - window[0]))
+            raise ProviderError('RATE_LIMITED', WINDOW - (now - window[0]))
         window.append(now)
+        self.current_method = method
         ret, data = getattr(self.context, method)(*args, **kwargs)
         if ret != 0:
             error = vendor_error(data)
             error.operation = method
+            error.vendor_ret = ret if isinstance(ret, int) else None
             raise error
+        now = self.mono()
         self.cache = {k: v for k, v in self.cache.items() if v[0] > now}
         if ttl:
-            self.cache[key] = (time.monotonic() + ttl, data)
+            self.cache[key] = (now + ttl, data)
         return data
+
+    def chain_window(self):
+        window = self.calls['get_option_chain']
+        now = self.mono()
+        while window and window[0] < now - WINDOW:
+            window.popleft()
+        return len(window)
 
     def permissions(self, require_options=True):
         state = self.call('get_global_state', ttl=2)
@@ -187,18 +294,18 @@ class FutuProvider:
         rows = await self.run(self.snapshots, list(set(mapping.values())))
         return {key: quote_from_row(rows[code]) for key, code in mapping.items() if code in rows}
 
-    def expirations(self, cfg, check_permissions=True):
+    def expirations(self, cfg, check_permissions=True, ttl=CHAIN_TTL):
         if check_permissions: self.permissions()
-        rows = self.call('get_option_expiration_date', code_for(cfg.underlyingId), ttl=1800)
+        rows = self.call('get_option_expiration_date', code_for(cfg.underlyingId), ttl=ttl)
         # Futu may still list dates that already expired (cached for up to 30 min too); drop them.
         return live_expirations(sorted(set(rows['strike_time'].tolist())), exchange_day(cfg, self.clock()))
 
     async def list_expirations(self, cfg):
         return await self.run(self.expirations, cfg)
 
-    def contracts(self, cfg, expiration, check_permissions=True):
+    def contracts(self, cfg, expiration, check_permissions=True, ttl=CHAIN_TTL):
         if check_permissions: self.permissions()
-        rows = self.call('get_option_chain', code_for(cfg.underlyingId), start=expiration, end=expiration, ttl=1800)
+        rows = self.call('get_option_chain', code_for(cfg.underlyingId), start=expiration, end=expiration, ttl=ttl)
         result = []
         for row in rows.to_dict('records'):
             if row.get('stock_owner') != code_for(cfg.underlyingId) or row.get('strike_time') != expiration:
@@ -234,26 +341,95 @@ class FutuProvider:
             out[c.id] = quote_from_row(row)
         return out
 
+    # ---- batch path: hot first, then warm with what is left (sections A, E.2) ----
     def batch_snapshots(self, configs):
-        """Warm static chains under rate limits, then batch all dynamic quotes.
+        """Quotes for monitors whose chain is cached, then warm at most WARM_PER_CYCLE chains.
 
-        Each monitor keeps its own errors; no expiry or strike substitution.
-        Two snapshot requests per warm cycle for the 20-symbol / 240-leg universe.
+        Each monitor keeps its own errors; no expiry or strike substitution. A monitor whose
+        chain is not cached gets CHAIN_WARMING (or CHAIN_UNAVAILABLE after the E.2 cap) and
+        its first quote in the next batch. Nothing stale is served in this path.
         """
-        self.permissions()
-        catalogs, errors = {}, {}
+        self.deadline = self.mono() + self.settings.hot_budget
+        try:
+            return self._batch(configs)
+        finally:
+            self.deadline = None
+
+    def _catalog(self, code, expiry, day, now):
+        if expiry < day:
+            return []  # expired: never replaced -> engine status EXPIRED, no OpenD call
+        chain = self.chains.get((code, expiry))
+        if chain and chain['expires'] > now:
+            return chain['contracts']
+        dates = self.dates.get(code)
+        if dates and dates['expires'] > now and expiry not in live_expirations(dates['dates'], day):
+            return []  # not listed -> NO_SAME_DAY_EXPIRY / EXPIRED from the engine
+        return None
+
+    def _batch(self, configs):
+        try:
+            self.permissions()
+        except DeadlineReached as d:
+            raise timeout_error(d.method) from None
+        wall, now = self.clock(), self.mono()
+        catalogs, errors, cold, info = {}, {}, {}, {}
         for mid, cfg in configs.items():
             try:
-                day = exchange_day(cfg, self.clock())
+                code = code_for(cfg.underlyingId)
+                day = exchange_day(cfg, wall)
                 expiry = target_expiry(cfg, day)
-                # An expired manual expiration is never replaced: empty catalog -> engine status EXPIRED.
-                dates = live_expirations(self.expirations(cfg, check_permissions=False), day)
-                catalogs[mid] = self.contracts(cfg, expiry, check_permissions=False) if expiry in dates else []
+                catalog = self._catalog(code, expiry, day, now)
+                if catalog is not None:
+                    catalogs[mid] = catalog
+                    info.setdefault((code, expiry), (cfg, day, 1 if expiry == day else 3))
+                else:
+                    cold.setdefault((code, expiry), []).append(mid)
+                    info[(code, expiry)] = (cfg, day, 1 if expiry == day else 3)
             except ProviderError as e:
                 errors[mid] = e
-        ready = {mid: cfg for mid, cfg in configs.items() if mid in catalogs}
-        if not ready:
-            return {}, errors
+        for key in [k for k, st in self.warm.items() if k not in cold and k[1] < exchange_day(Config(), wall)]:
+            del self.warm[key]
+        for key in cold:
+            if key not in self.warm:
+                self.warm[key] = WarmState(wall, now)
+        snapshots = {}
+        ready = {mid: configs[mid] for mid in catalogs}
+        if ready:
+            try:
+                snapshots, hot_errors = self._hot(ready, catalogs)
+                errors.update(hot_errors)
+            except DeadlineReached as d:
+                for mid in ready:
+                    errors[mid] = timeout_error(d.method)
+        warmed = self._warm(cold, info, catalogs)
+        for key, mids in cold.items():
+            st = self.warm[key]
+            waited = max(0, round((wall - st.since).total_seconds()))
+            chain = {'state': 'warming', 'reason': 'retrying' if st.last_error else 'queued',
+                     'waitingSeconds': waited, 'attempts': st.attempts, 'lastError': st.last_error}
+            if key not in warmed and st.last_error and waited > self.settings.chain_warm_max_seconds:
+                chain['state'] = 'unavailable'
+                error = 'CHAIN_UNAVAILABLE'
+                if not st.warned:
+                    st.warned = True
+                    log.warning('futu chain %s %s unavailable after %ds, %d attempts, last error %s',
+                                key[0], key[1], waited, st.attempts, st.last_error['code'])
+            else:
+                error = 'CHAIN_WARMING'
+            for mid in mids:
+                e = ProviderError(error, 10)
+                e.operation = 'get_option_chain'
+                e.chain = dict(chain)
+                errors[mid] = e
+        for key in warmed:
+            st = self.warm.pop(key, None)
+            if st is not None and st.attempts:
+                log.info('futu chain %s %s ready after %ds, %d attempts', key[0], key[1],
+                         (wall - st.since).total_seconds(), st.attempts + 1)
+        return snapshots, errors
+
+    def _hot(self, ready, catalogs):
+        errors = {}
         codes = list(dict.fromkeys(code_for(cfg.underlyingId) for cfg in ready.values()))
         states = self.call('get_market_state', codes, ttl=2).to_dict('records')
         states = {row['code']: row.get('market_state', 'UNKNOWN') for row in states}
@@ -286,13 +462,99 @@ class FutuProvider:
                 errors[mid] = e
         return snapshots, errors
 
+    def _dates(self, code, cfg, force=False):
+        """Fresh expirations for a symbol, fetching them if needed (one E call)."""
+        now = self.mono()
+        dates = self.dates.get(code)
+        if dates and dates['expires'] > now and not force:
+            return dates['dates']
+        values = self.expirations(cfg, check_permissions=False, ttl=0)
+        done = self.mono()
+        self.dates[code] = {'dates': values, 'fetched': done, 'expires': done + CHAIN_TTL}
+        return values
+
+    def _fail(self, key, error):
+        st = self.warm[key]
+        st.attempts += 1
+        st.last_error = {'code': error.code, 'at': self.clock().isoformat()}
+        if getattr(error, 'vendor_ret', None) is not None:
+            st.last_error['ret'] = error.vendor_ret
+        st.next_try = self.mono() + min(300, 10 * 2 ** (st.attempts - 1))
+        st.waiting = self.mono()  # back of the round-robin queue
+
+    def _warm(self, cold, info, catalogs):
+        """Warm/refresh queue: class 1 cold today, class 2 refresh-ahead, class 3 other cold."""
+        now = self.mono()
+        warm_cold = [k for k in cold if self.warm[k].next_try <= now]
+        refresh = [k for k in info if k not in cold and k in self.chains
+                   and now >= self.chains[k]['expires'] - REFRESH_LEAD and self.refresh_next.get(k, 0) <= now]
+        queue = (sorted([k for k in warm_cold if info[k][2] == 1], key=lambda k: (self.warm[k].waiting, k[0]))
+                 + sorted(refresh, key=lambda k: (self.chains[k]['fetched'], k[0]))
+                 + sorted([k for k in warm_cold if info[k][2] == 3], key=lambda k: (self.warm[k].waiting, k[0])))
+        warmed, chain_calls, served = set(), 0, set()
+        for key in queue:
+            if chain_calls >= self.settings.warm_per_cycle or self.chain_window() >= futu_config.CHAIN_LIMIT:
+                break
+            code, expiry = key
+            cfg, day, _ = info[key]
+            served.add(key)
+            try:
+                dates = self._dates(code, cfg)
+                if expiry not in live_expirations(dates, day):
+                    if key in cold:
+                        warmed.add(key)
+                    continue
+                chain_calls += 1
+                contracts = self.contracts(cfg, expiry, check_permissions=False, ttl=0)
+                done = self.mono()
+                self.chains[key] = {'contracts': contracts, 'fetched': done,
+                                    'expires': done + CHAIN_TTL + stagger(code)}
+                self.refresh_next.pop(key, None)
+                if key in cold:
+                    warmed.add(key)
+            except DeadlineReached:
+                served.discard(key)
+                break
+            except ProviderError as e:
+                if key in cold:
+                    self._fail(key, e)
+                else:
+                    self.refresh_next[key] = self.mono() + 10
+                    log.debug('futu chain refresh %s %s failed: %s', code, expiry, e.code)
+        # Prefetch expirations for the next queued cold symbols, then refresh-ahead expirations
+        # that are about to expire (own 50/window limit, at most PREFETCH_PER_BATCH per batch).
+        prefetched = 0
+        soon = [k for k in info if k not in cold and k not in self.chains and k[0] in self.dates
+                and self.mono() >= self.dates[k[0]]['expires'] - REFRESH_LEAD]
+        for key in [k for k in queue if k in cold and k not in served] + soon:
+            if prefetched >= PREFETCH_PER_BATCH:
+                break
+            code = key[0]
+            if key in cold and self.dates.get(code) and self.dates[code]['expires'] > self.mono():
+                continue
+            prefetched += 1
+            try:
+                self._dates(code, info[key][0], force=key not in cold)
+            except DeadlineReached:
+                break
+            except ProviderError as e:
+                if key in cold:
+                    self._fail(key, e)
+        return warmed
+
     async def collect_batch(self, configs):
         return await self.run(self.batch_snapshots, configs)
 
     async def close(self):
-        if self.pending is not None:
-            await asyncio.gather(self.pending, return_exceptions=True)
+        """Section B step 4: await pending (bounded), close the context in the executor thread, then shut down."""
+        if self.pending is not None and not self.pending.done():
+            done, _ = await asyncio.wait({self.pending}, timeout=self.settings.close_wait)
+            if not done:
+                log.error('futu close: call %s still pending after %ss, context not closed',
+                          self.current_method or self.pending_fn, self.settings.close_wait)
+                self.executor.shutdown(wait=False)
+                return
         if self.context is not None:
             await asyncio.get_running_loop().run_in_executor(self.executor, self.context.close)
             self.context = None
-        self.executor.shutdown(wait=False)
+        self.executor.shutdown(wait=True)

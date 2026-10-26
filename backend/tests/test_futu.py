@@ -12,6 +12,22 @@ CLOCK19=lambda:_dt(2026,10,19,15,0,tzinfo=_tz.utc)
 CLOCK23=lambda:_dt(2026,10,23,15,0,tzinfo=_tz.utc)
 
 
+class Mono:
+    """Fake monotonic clock: the batch deadline, limiter and chain TTL never depend on real time."""
+    def __init__(self): self.t=1000.0
+    def __call__(self): return self.t
+
+
+async def warm(p, configs, rounds=30):
+    """Run batches (31 s apart on the fake clock) until no monitor is CHAIN_WARMING; return the last batch."""
+    for _ in range(rounds):
+        snapshots,errors=await p.collect_batch(configs)
+        if not any(e.code=='CHAIN_WARMING' for e in errors.values()):
+            return snapshots,errors
+        p.mono.t+=31
+    raise AssertionError('chains never warmed')
+
+
 class OpenD:
     def __init__(self, rights='LV1'):
         self.rights = rights
@@ -142,11 +158,12 @@ async def test_supported_universe_batch_and_metadata_error_isolation():
                     option_strike_price=999 if symbol=='NVDA' and option else 100,
                     option_contract_size=100,option_type='CALL' if code.endswith(':C') else 'PUT'))
             return 0,pd.DataFrame(rows)
-    ctx=BatchOpenD();p=FutuProvider(ctx,clock=CLOCK23)
+    ctx=BatchOpenD();p=FutuProvider(ctx,clock=CLOCK23,mono=Mono())
     configs={s:Config(symbol=s,underlyingId=s,provider='futu',dataMode='API',expiryMode='manual',expiration='2026-10-23',nBelow=1,timeRule='days365',remainingDays=4) for s in FUTU_SYMBOLS}
     p.expirations=lambda cfg, **kwargs:['2026-10-23']
     p.contracts=lambda cfg,expiry, **kwargs:[Contract(id=code_for(cfg.underlyingId)+':'+right,underlyingId=cfg.underlyingId,expiration=expiry,strike=100,right=right) for right in ('C','P')]
     try:
+        await warm(p,configs);ctx.calls.clear();p.mono.t+=31
         snapshots,errors=await p.collect_batch(configs)
         assert set(snapshots)==set(FUTU_SYMBOLS)-{'NVDA'}
         assert errors['NVDA'].code=='CONTRACT_METADATA_MISMATCH'
@@ -163,16 +180,19 @@ async def test_supported_universe_batch_and_metadata_error_isolation():
 @pytest.mark.asyncio
 async def test_batch_keeps_ready_symbols_when_one_chain_is_rate_limited():
     ctx=OpenD();ctx.get_market_state=lambda codes:(0,pd.DataFrame([{'code':c,'market_state':'AFTERNOON'} for c in codes]))
-    p=FutuProvider(ctx,clock=CLOCK19);original=p.expirations
+    p=FutuProvider(ctx,clock=CLOCK19,mono=Mono());original=p.expirations
     def dates(cfg, **kwargs):
         if cfg.underlyingId=='QQQ':raise ProviderError('RATE_LIMITED',30)
         return original(cfg, **kwargs)
     p.expirations=dates
     try:
         configs={s:Config(provider='futu',dataMode='API',symbol=s,underlyingId=s,expiryMode='manual',expiration='2026-10-19',nBelow=1) for s in ('SPY','QQQ')}
-        snapshots,errors=await p.collect_batch(configs)
+        for _ in range(3):  # SPY warms within the first batches; QQQ keeps failing
+            snapshots,errors=await p.collect_batch(configs);p.mono.t+=31
         assert set(snapshots)=={'SPY'} and len(snapshots['SPY'].legs)==2
-        assert errors['QQQ'].retry_after==30
+        # QQQ's failure is per monitor: CHAIN_WARMING with the real cause, never a batch-wide error
+        assert errors['QQQ'].code=='CHAIN_WARMING' and errors['QQQ'].chain['lastError']['code']=='RATE_LIMITED'
+        assert errors['QQQ'].chain['reason']=='retrying' and errors['QQQ'].chain['attempts']>=1
     finally:await p.close()
 
 
@@ -197,6 +217,7 @@ async def test_worker_persists_batched_futu_results(sample):
     w.providers['futu'].collect_batch=batch
     try:
         await w.cycle()
+        await asyncio.wait({w.futu_task})  # the futu batch now runs as a background task
         assert calls==[set(ids)]
         with Session() as db:
             for mid in ids:
@@ -213,14 +234,16 @@ async def test_worker_persists_batched_futu_results(sample):
 @pytest.mark.asyncio
 async def test_batch_checks_permission_once_even_when_metadata_is_slow():
     ctx=OpenD();ctx.get_market_state=lambda codes:(0,pd.DataFrame([{'code':c,'market_state':'AFTERNOON'} for c in codes]))
-    p=FutuProvider(ctx,clock=CLOCK19);original=p.permissions;checks=[]
+    p=FutuProvider(ctx,clock=CLOCK19,mono=Mono());original=p.permissions;checks=[]
     def permission(*args,**kwargs):
         checks.append(1)
         return original(*args,**kwargs)
     p.permissions=permission
     try:
         cfg=Config(provider='futu',dataMode='API',expiryMode='manual',expiration='2026-10-19',nBelow=1)
-        snapshots,errors=await p.collect_batch({str(i):cfg for i in range(20)})
+        configs={str(i):cfg for i in range(20)}
+        await warm(p,configs);checks.clear();ctx.calls.clear();p.mono.t+=31
+        snapshots,errors=await p.collect_batch(configs)
         assert len(snapshots)==20 and not errors
         assert len(checks)==1
         assert ctx.calls.count('snapshot')==2
@@ -256,10 +279,10 @@ async def test_futu_expirations_drop_expired():
 
 @pytest.mark.asyncio
 async def test_batch_same_day_uses_today_not_expired():
-    ctx=ChainOpenD();p=FutuProvider(ctx,clock=CLOCK24)
+    ctx=ChainOpenD();p=FutuProvider(ctx,clock=CLOCK24,mono=Mono())
     try:
         cfg=Config(provider='futu',dataMode='API',nBelow=1)
-        snaps,errors=await p.collect_batch({'m':cfg})
+        snaps,errors=await warm(p,{'m':cfg})
         assert not errors and ('chain','2026-10-24') in ctx.calls
         assert not any(c==('chain','2026-10-23') for c in ctx.calls)
         assert compute(cfg,snaps['m'])['expiration']=='2026-10-24'
@@ -268,10 +291,10 @@ async def test_batch_same_day_uses_today_not_expired():
 @pytest.mark.asyncio
 @pytest.mark.parametrize('fixed,status_expired',[('2026-10-23',True),('2026-10-24',False),('2026-10-26',False)])
 async def test_batch_fixed_expiration_expired_is_reported_not_substituted(fixed,status_expired):
-    ctx=ChainOpenD();p=FutuProvider(ctx,clock=CLOCK24)
+    ctx=ChainOpenD();p=FutuProvider(ctx,clock=CLOCK24,mono=Mono())
     try:
         cfg=Config(provider='futu',dataMode='API',nBelow=1,expiryMode='manual',expiration=fixed)
-        snaps,errors=await p.collect_batch({'m':cfg})
+        snaps,errors=await warm(p,{'m':cfg})
         chains=[c[1] for c in ctx.calls if isinstance(c,tuple)]
         r=compute(cfg,snaps['m'])
         assert r['expiration']==fixed
