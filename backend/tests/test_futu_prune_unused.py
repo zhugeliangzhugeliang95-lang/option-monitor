@@ -1,14 +1,18 @@
-"""PR-C: at the NY day roll, chains/warm/refresh/dropped keys no batch config used during the previous
-day are pruned (batch start only). No live OpenD: fakes from test_futu_swr / test_futu_cache."""
+"""PR-C (#25): at the NY day roll, chains/warm/refresh/dropped keys that no batch config used on either
+of the last two NY days are pruned (batch start only). A day with no batch past _permissions()
+(OpenD offline) is not counted. No live OpenD: fakes from test_futu_swr / test_futu_cache."""
+import logging
 from datetime import datetime, timezone
 import pytest
 from app.futu import WarmState
+from app.providers import ProviderError
 from test_futu_swr import make, cfg, run, warmed, LIMIT
 
 UTC = timezone.utc
 THU = datetime(2026, 10, 22, 19, 50, tzinfo=UTC)   # Thu 15:50 New York
 TO_FRI = 17 * 3600 + 20 * 60                        # -> Fri 09:10 New York
-FAR = ('US.SPY', '2026-10-30')   # far-dated relative to Thu (fake lists only this future expiry)
+DAY = 24 * 3600
+FAR = ('US.SPY', '2026-10-30')   # far-dated relative to Thu (the fake lists only this future expiry)
 NEAR = ('US.QQQ', '2026-10-30')
 
 
@@ -16,50 +20,75 @@ def stores(p):
     return (p.chains, p.warm, p.refresh, p.dropped)
 
 
-@pytest.mark.asyncio
-async def test_deleted_far_dated_key_pruned_at_roll_used_key_kept_and_served_stale():
+async def setup():
     p, ctx, mono, wall = make(base=THU)
+    far, near = cfg(expiration=FAR[1]), cfg('QQQ', expiration=NEAR[1])
+    await warmed(p, {**far, **near})
+    assert FAR in p.chains and NEAR in p.chains
+    return p, ctx, mono, wall, far, near
+
+
+@pytest.mark.asyncio
+async def test_c_key_unused_two_days_pruned_used_key_kept_and_served_stale(caplog):
+    """(c)+(d): deleted far-dated monitor's key goes only after two unused NY days; a used key stays SWR."""
+    p, ctx, mono, wall, far, near = await setup()
     try:
-        far, near = cfg(expiration=FAR[1]), cfg('QQQ', expiration=NEAR[1])
-        await warmed(p, {**far, **near})
-        assert FAR in p.chains and NEAR in p.chains
         wall.jump(TO_FRI); mono.t += LIMIT
-        snaps, errors = await run(p, near)        # first Friday batch: roll at batch start; SPY was used on Thursday
-        assert FAR in p.chains                    # (SPY monitor deleted after Thursday: no Friday use from here on)
-        assert NEAR in p.chains and 'QQQ' in snaps and not errors   # still used: kept, SWR-served stale
-        assert p.chain_meta['QQQ']['stale'] is True
+        snaps, errors = await run(p, near)        # Fri roll: SPY used Thu -> kept
+        assert FAR in p.chains and 'QQQ' in snaps and not errors and p.chain_meta['QQQ']['stale'] is True
         p.warm[FAR] = WarmState(wall(), mono.t); p.refresh[FAR] = {'failures': 1, 'next': 0.0}; p.dropped[FAR] = 'MAX_AGE'
-        await run(p, near, n=3)
-        wall.jump(24 * 3600)                      # Saturday roll: FAR unused for the whole Friday
-        await run(p, near)
-        assert all(FAR not in s for s in stores(p))
-        assert NEAR in p.chains
+        wall.jump(DAY); await run(p, near)        # Sat roll: unused Fri only, used Thu -> kept
+        assert FAR in p.chains
+        caplog.set_level(logging.INFO, logger='app.futu')
+        wall.jump(DAY); await run(p, near)        # Sun roll: unused Fri and Sat -> pruned everywhere
+        assert all(FAR not in s for s in stores(p)) and NEAR in p.chains
+        msg = [r.getMessage() for r in caplog.records if 'day roll' in r.getMessage()][-1]
+        assert 'swept 1 chains (0 expired, 1 unused)' in msg and '3 unused warm/refresh/dropped entries' in msg
     finally:
         await p.close()
 
 
 @pytest.mark.asyncio
-async def test_key_used_in_previous_day_survives_even_if_absent_from_first_batch():
-    p, ctx, mono, wall = make(base=THU)
+async def test_a_opend_offline_all_friday_keeps_keys_after_saturday_roll(monkeypatch):
+    """(a): every Friday batch fails in _permissions (OPEND_OFFLINE): Friday does not count."""
+    p, ctx, mono, wall, far, near = await setup()
     try:
-        far, near = cfg(expiration=FAR[1]), cfg('QQQ', expiration=NEAR[1])
-        await warmed(p, {**far, **near})
+        def offline(*a, **k): raise ProviderError('OPEND_OFFLINE')
+        monkeypatch.setattr(p, 'permissions', offline)
         wall.jump(TO_FRI)
-        await run(p, near)                        # SPY in backoff, not in this batch
-        assert FAR in p.chains                    # used on Thursday: kept
-        wall.jump(24 * 3600)                      # Saturday roll: SPY unused all Friday -> pruned
-        await run(p, near)
+        for _ in range(5):
+            with pytest.raises(ProviderError):
+                await run(p, {**far, **near})
+        monkeypatch.undo()
+        wall.jump(DAY); await run(p, near)        # Sat roll after an all-offline Friday
+        assert FAR in p.chains and NEAR in p.chains
+        wall.jump(DAY); await run(p, near)        # Sun: Thu usage merged, not lost; Sat counted, still in 2-day window
+        assert FAR in p.chains
+        wall.jump(DAY); await run(p, near)        # Mon: FAR unused Sat and Sun (both counted) -> pruned
         assert FAR not in p.chains and NEAR in p.chains
     finally:
         await p.close()
 
 
 @pytest.mark.asyncio
-async def test_no_prune_mid_day_or_on_first_batch_after_start():
-    p, ctx, mono, wall = make(base=THU)
+async def test_b_monitor_in_backoff_one_whole_day_not_pruned():
+    """(b): SPY absent from every Friday batch (backoff), back on Saturday: never pruned."""
+    p, ctx, mono, wall, far, near = await setup()
     try:
-        far, near = cfg(expiration=FAR[1]), cfg('QQQ', expiration=NEAR[1])
-        await warmed(p, {**far, **near})
+        wall.jump(TO_FRI); await run(p, near, n=3)
+        wall.jump(DAY); mono.t += LIMIT
+        snaps, errors = await run(p, {**far, **near})   # Sat roll, then SPY is back
+        assert FAR in p.chains and 'SPY' in snaps
+        wall.jump(DAY); await run(p, near)        # Sun: used Sat -> kept
+        assert FAR in p.chains
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+async def test_no_prune_mid_day_or_on_first_roll_after_start():
+    p, ctx, mono, wall, far, near = await setup()
+    try:
         await run(p, near, n=5)                   # same day, far key unused: never pruned mid-day
         assert FAR in p.chains
         mono.t += LIMIT                           # within MAX_AGE: SPY still served stale when it returns
@@ -71,14 +100,13 @@ async def test_no_prune_mid_day_or_on_first_batch_after_start():
 
 @pytest.mark.asyncio
 async def test_recreated_after_prune_rewarms_normally():
-    p, ctx, mono, wall = make(base=THU)
+    p, ctx, mono, wall, far, near = await setup()
     try:
-        far, near = cfg(expiration=FAR[1]), cfg('QQQ', expiration=NEAR[1])
-        await warmed(p, {**far, **near})
         wall.jump(TO_FRI); await run(p, near)
-        wall.jump(24 * 3600); await run(p, near)
+        wall.jump(DAY); await run(p, near)
+        wall.jump(DAY); await run(p, near)
         assert FAR not in p.chains
         snaps = await warmed(p, far)              # monitor created again for the same key
-        assert 'SPY' in snaps and FAR in p.chains and p.chains[FAR]['fetchedDay'] == '2026-10-24'
+        assert 'SPY' in snaps and FAR in p.chains and p.chains[FAR]['fetchedDay'] == '2026-10-25'
     finally:
         await p.close()
