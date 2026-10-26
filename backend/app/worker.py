@@ -8,6 +8,7 @@ from .engine import selected_strikes
 from .providers import provider_for, ProviderError, regular_session, exchange_day, live_expirations, target_expiry
 from .service import save_snapshot, persist_statistics
 from . import retention
+from .logs import configure as configure_logging
 log=logging.getLogger('app.worker')
 
 class Worker:
@@ -52,9 +53,15 @@ class Worker:
                 operation=getattr(e,'operation',None)
                 status=e.code if isinstance(e,ProviderError) else 'TIMEOUT'; self.failures[mid]=self.failures.get(mid,0)+1
                 retry=max(10,getattr(e,'retry_after',0)) if status=='RATE_LIMITED' else max(getattr(e,'retry_after',0),min(120,10*2**(self.failures[mid]-1)))
+                # Only our own error code/operation: never the provider message, params or config.
+                log.warning('provider error monitor=%s provider=%s symbol=%s status=%s operation=%s duration=%.3fs failures=%d retry=%ss',
+                    mid,cfg.provider,cfg.underlyingId,status,operation,time.monotonic()-started,self.failures[mid],retry)
             except Exception:
                 status='INVALID_PROVIDER_DATA'; self.failures[mid]=self.failures.get(mid,0)+1; retry=10
+                log.exception('unexpected collect failure monitor=%s provider=%s symbol=%s duration=%.3fs failures=%d',
+                    mid,cfg.provider,cfg.underlyingId,time.monotonic()-started,self.failures[mid])
             duration=time.monotonic()-started
+            if duration>=10: log.warning('slow collect monitor=%s symbol=%s status=%s duration=%.3fs',mid,cfg.underlyingId,status,duration)
             self.next_due[mid]=time.monotonic()+max(10-(time.time()%10),retry)
             with Session() as db:
                 db.add(record(ProviderStatus,mid,rc.id,{'status':status,'operation':operation,'durationSeconds':duration,'retryAfter':retry,'delayed':duration>=10 or retry>0,'at':nowstr()}))
@@ -79,6 +86,8 @@ class Worker:
                         await self.collect(mid,rc,prepared=snapshots.get(mid),pre_error=errors.get(mid))
                 except Exception as e:
                     error = e if isinstance(e,ProviderError) else ProviderError('TIMEOUT' if isinstance(e,TimeoutError) else 'INVALID_PROVIDER_DATA')
+                    if isinstance(e,(ProviderError,TimeoutError)): log.warning('futu batch failed status=%s monitors=%d',error.code,len(items))
+                    else: log.exception('futu batch failed status=%s monitors=%d',error.code,len(items))
                     for mid,rc in items:
                         await self.collect(mid,rc,pre_error=error)
                 return
@@ -87,6 +96,8 @@ class Worker:
                 await asyncio.gather(*(self.collect(mid,rc,quotes.get(rc.payload['underlyingId'])) for mid,rc in items))
             except Exception as e:
                 error=e if isinstance(e,ProviderError) else ProviderError('TIMEOUT' if isinstance(e,TimeoutError) else 'INVALID_PROVIDER_DATA')
+                if isinstance(e,(ProviderError,TimeoutError)): log.warning('%s underlying batch failed status=%s monitors=%d',name,error.code,len(items))
+                else: log.exception('%s underlying batch failed status=%s monitors=%d',name,error.code,len(items))
                 async def individual(mid,rc):
                     try:
                         async with asyncio.timeout(8): q=await self.providers[name].get_underlying_snapshots([rc.payload['underlyingId']])
@@ -101,6 +112,7 @@ class Worker:
         await asyncio.gather(*(group(name,[(m,r) for m,r in due if r.payload['provider']==name]) for name in self.providers if any(r.payload['provider']==name for _,r in due)))
     async def run(self):
         hb=asyncio.create_task(self.heartbeat()); minute=None; retention_day=None; zone=retention.exchange_zone()
+        log.info('worker started pid=%s providers=%s',os.getpid(),','.join(self.providers))
         try:
             while True:
                 await self.cycle()
@@ -117,9 +129,10 @@ class Worker:
         finally:
             self.running=False; hb.cancel(); await asyncio.gather(hb,return_exceptions=True)
             for p in self.providers.values(): await p.close()
+            log.info('worker stopped pid=%s',os.getpid())
 
 def main():
-    logging.basicConfig(level=os.getenv('LOG_LEVEL','INFO'),format='%(asctime)s %(levelname)s %(name)s %(message)s')
+    configure_logging()
     lock=open(str(DB_PATH)+'.worker.lock','w')
     try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError: raise SystemExit('A worker already owns this database')
