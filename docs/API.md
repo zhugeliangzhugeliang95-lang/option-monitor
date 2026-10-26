@@ -38,18 +38,17 @@
 
 仅供前端判断「历史 / 过旧快照」的显示阈值；不改变 `maxAgeSeconds` 本身、报价质量判定、config hash/configId 或统计窗口。`/api/monitors/{id}/history`、`/api/snapshots/{id}`、`summary=1` 不变。旧前端可忽略；新前端缺字段时回退 `max(maxAgeSeconds, 20)`。
 
-真实运行示例（临时库、MOCK、无 worker 心跳；两个监测 maxAgeSeconds 分别为 5 和 30，节选字段）：
+真实运行示例（临时库、MOCK、`python -m app.worker` 实跑；SPY 监测 maxAgeSeconds=5，节选字段）：
 
 ```json
 // GET /api/providers/status（节选）
-{"cycleSeconds": 10, "worker": null, "workerStatus": "INTERRUPTED", "monitors": {...}}
+{"cycleSeconds": 10, "worker": {"heartbeatAt": "2026-10-26T12:15:07.645730+00:00", "pid": 280497, "targetSeconds": 10}, "workerStatus": "RUNNING", "monitors": {...}}
 
 // GET /api/results/latest（节选）
-{
-  "942ae29e5d2b469e8f9ea98f15c0a56a": {"valuationAt": "2026-10-26T11:58:58.504397+00:00", "staleAfterSeconds": 20, ...},
-  "4ccbf032eabc41d6bd20dd3bd974ed24": {"valuationAt": "2026-10-26T11:58:58.515952+00:00", "staleAfterSeconds": 30, ...}
-}
+{"9263556b78f1423d99402abf85f44069": {"valuationAt": "2026-10-26T12:15:00.041056+00:00", "status": "OK", "anchorStrictEligible": true, "staleAfterSeconds": 20, ...}}
 ```
+
+无 worker 心跳时：`{"cycleSeconds": 10, "worker": null, "workerStatus": "INTERRUPTED", ...}`；maxAgeSeconds=30 的监测 `staleAfterSeconds` 为 30。
 
 ### 统计诊断字段 / Statistics diagnostic fields
 
