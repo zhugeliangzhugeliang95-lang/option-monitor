@@ -56,6 +56,8 @@ export const fmt=(n:any,d=3)=>typeof n==='number'&&Number.isFinite(n)?n.toLocale
 // 422 pydantic 数组：取每项 msg，去掉 "Value error, " 前缀，拼成可读文字
 export const readableDetail=(items:any[])=>items.map(x=>{const msg=String(x?.msg??'').replace(/^Value error,\s*/,'');const loc=Array.isArray(x?.loc)?x.loc.filter((p:any)=>p!=='body').join('.'):'';return loc?`${loc}：${msg}`:msg;}).filter(Boolean).join('；')||'请求参数不合法';
 // 与后端 models.SYMBOL_RE 一致（#12）：字母数字开头，允许 . - _，最长 20（前端已转大写）
+// 先拒绝非可打印 ASCII：避免 ß、ﬀ 经 toUpperCase 变成 SS/FF 后通过（后端对原始输入会拒绝）
+export const PRINTABLE_ASCII_RE=/^[\x20-\x7E]*$/;
 export const SYMBOL_RE=/^[A-Z0-9][A-Z0-9._-]{0,19}$/;
 export const ZONE_KEY='option-monitor.zone';
 export const browserZone=()=>{try{return Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';}catch{return 'UTC';}};
