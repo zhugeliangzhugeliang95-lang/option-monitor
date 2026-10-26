@@ -4,7 +4,10 @@ HERE=pathlib.Path(__file__).resolve().parent
 SHOTS=HERE/'shots';SHOTS.mkdir(exist_ok=True)
 import asyncio,json,re
 from playwright.async_api import async_playwright
-R=[];SPY='7b233ee8281a408b82de728e5c1834ea'
+import urllib.request
+R=[]
+# 依赖：后端里有一个 symbol=SPY 的启用监测（MOCK 默认种子数据里有）；按 symbol 查 id，不写死
+SPY=next(m['id'] for m in json.load(urllib.request.urlopen(BASE+'/api/monitors')) if m.get('config',{}).get('symbol')=='SPY' and m.get('active'))
 def ok(n,c,x=''): R.append(c); print('PASS' if c else 'FAIL',n,x)
 CASES=[
  ('OPEND_OFFLINE',{'status':'OPEND_OFFLINE','chain':{'state':'warming'}},None,['OpenD 未启动或无法连接'],['11111'],'true'),

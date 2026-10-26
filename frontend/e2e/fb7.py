@@ -3,7 +3,9 @@
 import asyncio,json,re,time,os,datetime as dt
 BASE=os.environ.get('E2E_BASE_URL','http://localhost:3200')
 from playwright.async_api import async_playwright
-R=[];SPY='7b233ee8281a408b82de728e5c1834ea'
+import urllib.request
+R=[]
+SPY=next(m['id'] for m in json.load(urllib.request.urlopen(BASE+'/api/monitors')) if m.get('config',{}).get('symbol')=='SPY' and m.get('active'))
 def ok(n,c,x=''): R.append(c); print('PASS' if c else 'FAIL',n,x)
 T=int(time.time())*1000
 iso=lambda age: dt.datetime.fromtimestamp((T-age*1000)/1000,dt.timezone.utc).isoformat()

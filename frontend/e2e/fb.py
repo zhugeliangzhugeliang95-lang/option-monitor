@@ -1,8 +1,12 @@
 import os,pathlib
 BASE=os.environ.get('E2E_BASE_URL','http://localhost:3200')
+# 写操作（通过 API 创建测试监测 ZZFB）默认不执行：须显式设置 E2E_BASE_URL 或 E2E_ALLOW_WRITE=1；结束时 DELETE 本次新建的监测（后端为停用，历史保留）
+ALLOW_WRITE=bool(os.environ.get('E2E_BASE_URL')) or os.environ.get('E2E_ALLOW_WRITE')=='1'
 HERE=pathlib.Path(__file__).resolve().parent
 SHOTS=HERE/'shots';SHOTS.mkdir(exist_ok=True)
-import asyncio,json,re
+import asyncio,json,re,urllib.request
+def api(path,method='GET'):
+  with urllib.request.urlopen(urllib.request.Request(BASE+'/api'+path,method=method)) as f: return json.load(f)
 from playwright.async_api import async_playwright
 S=str(SHOTS)+'/'
 R=[]
@@ -41,6 +45,10 @@ async def main():
     box=await ce.bounding_box();top=await pg.evaluate("([x,y])=>!!document.elementFromPoint(x,y)?.closest('[data-testid=create-error]')",[box['x']+box['width']/2,box['y']+box['height']/2])
     ok('错误未被遮罩挡住',top)
     await pg.screenshot(path=S+'futu_422_in_modal.png')
+    if not ALLOW_WRITE:
+      print('SKIP 创建 ZZFB 及后续依赖步骤（未设置 E2E_BASE_URL / E2E_ALLOW_WRITE=1）')
+      await b.close();print('SUMMARY',sum(r[1] for r in R),'/',len(R));return
+    before={m['id'] for m in api('/monitors')}
     await sel.select_option('manual');await inp.fill('  zzfb  ');await pg.get_by_role('button',name='创建监测').click();await pg.wait_for_timeout(2000)
     body=json.loads(posts[-1]);ok('前后空格被 trim',body['symbol']=='ZZFB' and body['underlyingId']=='ZZFB',posts[-1][:80])
     ok('成功后显示已创建',await pg.locator('.message').filter(has_text='已创建').count()>0)
@@ -67,6 +75,9 @@ async def main():
     ok('非法时间显示—，无 Invalid Date','统计截至 —' in txt and 'Invalid Date' not in txt)
     ok('可选 reason/lastGapAt 显示且无时区按UTC','原因：采集中断' in txt and '最近一次中断：2026/10/26 13:40:00 GMT+8' in txt)
     await pg.screenshot(path=S+'stats_optional_fields.png',full_page=True)
+    created=[m['id'] for m in api('/monitors') if m['id'] not in before]
+    for mid in created: api(f'/monitors/{mid}','DELETE')
+    ok('清理：本次新建的监测已 DELETE（停用）',len(created)==1 and all(m['id'] not in created for m in api('/monitors') if m.get('active')),str(created))
     print('console errors',[e for e in errs if '422' not in e][:5])
     await b.close()
   print('SUMMARY',sum(r[1] for r in R),'/',len(R))
