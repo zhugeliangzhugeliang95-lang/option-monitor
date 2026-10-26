@@ -13,7 +13,45 @@ export const focusSymbols=['TSLA','NVDA','META','AMZN','GOOGL','AAPL','MSFT'];
 export const focusRank=(m:Obj)=>{const rank=focusSymbols.indexOf(m.config.symbol);return rank<0?focusSymbols.length:rank;};
 export const bases=['BID','ASK','MID','LAST','CUSTOM'];
 export const labels:Obj={BID:'买一',ASK:'卖一',MID:'中间价',LAST:'最新成交',CUSTOM:'自定义'};
-export const statusLabels:Obj={FUTU_RIGHTS_READY:'富途权限就绪 · 等待报价核验',FUTU_OPTION_PERMISSION_REQUIRED:'缺少 OpenAPI 美股期权权限',FUTU_STOCK_PERMISSION_REQUIRED:'缺少 OpenAPI 美股正股权限',OPEND_OFFLINE:'OpenD 未启动',OPEND_LOGIN_REQUIRED:'请登录 OpenD 并完成协议',FUTU_SDK_MISSING:'富途 SDK 未安装',FUTU_BUSY:'富途请求处理中',FUTU_REQUEST_FAILED:'富途请求失败',CONTRACT_METADATA_MISMATCH:'合约资料不匹配',UNSUPPORTED_SYMBOL:'不在已配置的美股/ETF标的中',EXPIRED:'合约已过期',MANUAL_PRICE_ONLY:'人工快照 · 价格计算',CLOSED_OR_UNKNOWN_SESSION:'休市 / 交易时段未确认',PAUSED:'采集已暂停',PLEASE_SET_COUNTS:'请设置选档数量',NO_SAME_DAY_EXPIRY:'今天没有可用到期期权',PARTIAL_OR_INELIGIBLE:'部分档位 / 质量未通过',INVALID_SELECTION_ANCHOR:'选档成交价过旧或缺时间',MISSING_ANCHOR:'缺少选档成交价',NOT_CONFIGURED:'未配置 API',WAITING_WORKER:'等待采集',MANUAL_INPUT_REQUIRED:'等待人工输入',RATE_LIMITED:'供应商限流',TIMEOUT:'请求超时',PERMISSION_DENIED:'行情权限不足',CONNECTION_OR_PROTOCOL_ERROR:'行情连接中断',INSUFFICIENT_SAMPLES:'样本积累中',ZERO_SE:'方差为零 / SE 过小',OK:'计算完成'};
+export const statusLabels:Obj={FUTU_RIGHTS_READY:'富途权限就绪 · 等待报价核验',FUTU_OPTION_PERMISSION_REQUIRED:'缺少 OpenAPI 美股期权权限',FUTU_STOCK_PERMISSION_REQUIRED:'缺少 OpenAPI 美股正股权限',OPEND_OFFLINE:'OpenD 未启动',OPEND_LOGIN_REQUIRED:'请登录 OpenD 并完成协议',FUTU_SDK_MISSING:'富途 SDK 未安装',FUTU_BUSY:'富途请求处理中',FUTU_REQUEST_FAILED:'富途请求失败',CONTRACT_METADATA_MISMATCH:'合约资料不匹配',UNSUPPORTED_SYMBOL:'不在已配置的美股/ETF标的中',EXPIRED:'合约已过期',MANUAL_PRICE_ONLY:'人工快照 · 价格计算',CLOSED_OR_UNKNOWN_SESSION:'休市 / 交易时段未确认',PAUSED:'采集已暂停',PLEASE_SET_COUNTS:'请设置选档数量',NO_SAME_DAY_EXPIRY:'今天没有可用到期期权',PARTIAL_OR_INELIGIBLE:'部分档位 / 质量未通过',INVALID_SELECTION_ANCHOR:'选档成交价过旧或缺时间',MISSING_ANCHOR:'缺少选档成交价',NOT_CONFIGURED:'未配置 API',WAITING_WORKER:'等待采集',MANUAL_INPUT_REQUIRED:'等待人工输入',RATE_LIMITED:'供应商限流',TIMEOUT:'请求超时',PERMISSION_DENIED:'行情权限不足',CONNECTION_OR_PROTOCOL_ERROR:'行情连接中断',INSUFFICIENT_SAMPLES:'样本积累中',ZERO_SE:'方差为零 / SE 过小',OK:'计算完成',OPEND_UNRESPONSIVE:'OpenD 无响应（未重建连接，请检查 OpenD）',CHAIN_WARMING:'期权链加载中（排队预热），稍后出数',CHAIN_WARMING_OFFHOURS:'盘外，等待开盘前预热（约 09:00 美东）',CHAIN_UNAVAILABLE:'期权链长时间无法获取，请检查权限或 OpenD'};
+// ---- Futu 超时方案 v5「用户可见状态（最终）」前端准备：后端字段全部可选，没有时不显示任何新东西 ----
+export type ChainLastError={code?:string;ret?:number|string;at?:string};
+export type ChainInfo={state?:string;reason?:string;stale?:boolean;ageSeconds?:number;expirationsStale?:boolean;waitingSeconds?:number;attempts?:number;lastError?:ChainLastError|null;droppedReason?:string;offHours?:boolean};
+export type ProviderStatusRow=Obj&{status?:string;operation?:string|null;pendingSeconds?:number;message?:string;chain?:ChainInfo|null};
+// 带占位的模板：{operation} {pendingSeconds} {code} {n}；字段缺失时整段 （…） 省略。不写死秒数和端口
+export const futuStatusTemplates:Record<string,string>={
+ OPEND_OFFLINE:'OpenD 未启动或无法连接',
+ OPEND_UNRESPONSIVE:'OpenD 无响应：请求已卡住超过 {pendingSeconds} 秒（未重建连接，请检查 OpenD）',
+ TIMEOUT:'富途请求超时（{operation}），稍后自动重试',
+ FUTU_BUSY:'富途通道忙：上一请求尚未完成，本轮跳过',
+ CHAIN_WARMING:'期权链加载中（排队预热），稍后出数',
+ CHAIN_WARMING_OFFHOURS:'盘外，等待开盘前预热（约 09:00 美东）',
+ CHAIN_UNAVAILABLE:'期权链长时间无法获取（错误码 {code}），请检查权限或 OpenD'};
+// 是否算失败（对照计划表与 worker.py NON_FAILURE / NO_BACKOFF）
+export const futuFailure:Record<string,boolean>={OPEND_OFFLINE:true,OPEND_UNRESPONSIVE:true,TIMEOUT:true,FUTU_BUSY:false,CHAIN_WARMING:false,CHAIN_WARMING_OFFHOURS:false,CHAIN_UNAVAILABLE:true};
+export const NEW_FUTU_STATUSES=['OPEND_UNRESPONSIVE','CHAIN_WARMING','CHAIN_UNAVAILABLE'];
+const fillTemplate=(t:string,v:Record<string,unknown>)=>t.replace(/（[^（）]*\{(\w+)\}[^（）]*）|\{(\w+)\}/g,(m,a,b)=>{const k=a||b,x=v[k];const ok=x!=null&&x!=='';if(!ok)return a?'':'';return m.replace(`{${k}}`,String(x));});
+const isOffHours=(c?:ChainInfo|null)=>!!c&&(c.reason==='offHours'||c.offHours===true);
+/** 状态码 + 可选 chain 对象 → 展示文案与是否算失败。未知码回退 message，再回退 code。 */
+export function futuStatusView(row:ProviderStatusRow|null|undefined):{key:string;text:string;failure:boolean|null}|null{
+ if(!row||typeof row.status!=='string'||!row.status)return null;
+ const chain=row.chain&&typeof row.chain==='object'?row.chain:null;
+ const key=row.status==='CHAIN_WARMING'&&isOffHours(chain)?'CHAIN_WARMING_OFFHOURS':row.status;
+ const tpl=futuStatusTemplates[key];
+ if(tpl){const pend=isNum(row.pendingSeconds)?Math.round(row.pendingSeconds):undefined;
+  const text=fillTemplate(tpl,{operation:row.operation,pendingSeconds:pend,code:chain?.lastError?.code});
+  return {key,text:key==='OPEND_UNRESPONSIVE'&&pend==null?statusLabels.OPEND_UNRESPONSIVE:text,failure:futuFailure[key]};}
+ const text=statusLabels[key]||(typeof row.message==='string'&&row.message)||key;
+ return {key,text,failure:null};}
+/** chain 缓存标记 → 徽标文案（字段缺失返回空数组） */
+export function chainBadges(c:ChainInfo|null|undefined):string[]{if(!c||typeof c!=='object')return [];const out:string[]=[];
+ if(c.stale===true)out.push(isNum(c.ageSeconds)?`期权链为缓存（${Math.max(0,Math.round(c.ageSeconds/60))} 分钟前），后台刷新中`:'期权链为缓存，后台刷新中');
+ if(c.expirationsStale===true)out.push('到期日列表为缓存（OpenD 暂不可用）');return out;}
+/** provider_status 行是否带有 v5 新字段 / 新状态（没有则页面保持现状） */
+export const hasFutuV5Fields=(row:ProviderStatusRow|null|undefined)=>{if(!row||typeof row.status!=='string'||!row.status)return false;const s=row.status;
+ // 已知 Futu 状态：新状态，或带了新字段；其他已有状态（OK 等）一律走原逻辑；未知状态只有带 chain 时才走新逻辑
+ if(futuStatusTemplates[s])return NEW_FUTU_STATUSES.includes(s)||row.chain!=null||row.pendingSeconds!=null||(s==='TIMEOUT'&&!!row.operation);
+ return !statusLabels[s]&&row.chain!=null;};
 export const fmt=(n:any,d=3)=>typeof n==='number'&&Number.isFinite(n)?n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}):'—';
 // 422 pydantic 数组：取每项 msg，去掉 "Value error, " 前缀，拼成可读文字
 export const readableDetail=(items:any[])=>items.map(x=>{const msg=String(x?.msg??'').replace(/^Value error,\s*/,'');const loc=Array.isArray(x?.loc)?x.loc.filter((p:any)=>p!=='body').join('.'):'';return loc?`${loc}：${msg}`:msg;}).filter(Boolean).join('；')||'请求参数不合法';
