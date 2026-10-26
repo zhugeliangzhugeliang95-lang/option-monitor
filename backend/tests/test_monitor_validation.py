@@ -43,3 +43,47 @@ def test_legacy_odd_symbol_still_readable_and_updatable():
     r=client.patch(f'/api/monitors/{mid}',json={'nBelow':2}); assert r.status_code==200 and r.json()['config']['symbol']=='!!$# legacy'
     assert client.patch(f'/api/monitors/{mid}',json={'symbol':'!!$# legacy','nAbove':1}).status_code==200
     assert client.patch(f'/api/monitors/{mid}',json={'symbol':'!!$#'}).status_code==422
+
+# --- follow-up to #12 review ---
+from app.db import RunConfig
+from app.service import config_for
+
+@pytest.mark.parametrize('bad',[123,None,True,['SPY'],{'a':1},1.5])
+@pytest.mark.parametrize('field',['symbol','underlyingId'])
+def test_patch_non_string_symbol_message(bad,field):
+    mid=post('SPY').json()['id']
+    r=client.patch(f'/api/monitors/{mid}',json={field:bad}); assert r.status_code==422,r.text
+    d=r.json()['detail']; assert '必须是字符串' in d and f'{field} must be a string' in d
+
+def legacy(sym):
+    with Session() as db:
+        m=create_monitor(db,Config(symbol=sym,underlyingId=sym,provider='mock',dataMode='MOCK'))
+        rc=config_for(db,m); return m.id,rc.id,rc.hash,rc.version
+
+def test_legacy_padded_symbol_read_unchanged():
+    mid,cid,h,v=legacy('  ZZSP  ')
+    with Session() as db: rc=db.get(RunConfig,cid); assert Config.model_validate(rc.payload).symbol=='  ZZSP  '
+    m=next(m for m in client.get('/api/monitors').json() if m['id']==mid)
+    assert m['config']['symbol']=='  ZZSP  ' and m['hash']==h and m['version']==v
+
+@pytest.mark.parametrize('patch',[{},{'symbol':'  ZZSP  '},{'symbol':'  ZZSP  ','underlyingId':'  ZZSP  '}])
+def test_noop_patch_on_legacy_keeps_hash_and_version(patch):
+    mid,cid,h,v=legacy('  ZZSP  ')
+    r=client.patch(f'/api/monitors/{mid}',json=patch).json()
+    assert r['configId']==cid and r['hash']==h and r['version']==v
+
+def test_unrelated_patch_on_legacy_keeps_symbol():
+    mid,cid,h,v=legacy('  ZZSP  ')
+    r=client.patch(f'/api/monitors/{mid}',json={'nBelow':2}).json()
+    assert r['config']['symbol']=='  ZZSP  ' and r['version']==v+1
+
+def test_changed_symbol_is_trimmed_and_same_value_after_trim_is_noop():
+    mid=post('SPY').json()['id']; before=client.get('/api/monitors').json()
+    h=next(m for m in before if m['id']==mid)['hash']
+    r=client.patch(f'/api/monitors/{mid}',json={'symbol':' SPY '}).json(); assert r['hash']==h and r['config']['symbol']=='SPY'
+    with Session() as db:
+        mid2,_,_,_=legacy('  ZZSP  ')
+    r=client.patch(f'/api/monitors/{mid2}',json={'symbol':' QQQ '}).json(); assert r['config']['symbol']=='QQQ'
+
+def test_plain_config_does_not_trim():
+    assert Config(symbol=' A ',underlyingId=' A ',provider='mock',dataMode='MOCK').symbol==' A '

@@ -14,8 +14,9 @@ SYMBOL_RE=re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,%d}'%(SYMBOL_MAX-1))
 def check_symbol(value,field='symbol'):
     """Format check for a NEW or CHANGED symbol/underlyingId (create, or update that changes it).
     Not applied when reading stored configs, so legacy monitors with odd symbols keep working."""
-    v=value.strip() if isinstance(value,str) else value
-    if not isinstance(v,str) or not v: raise ValueError(f'标的代码不能为空 / {field} must not be empty')
+    if not isinstance(value,str): raise ValueError(f'标的代码必须是字符串 / {field} must be a string')
+    v=value.strip()
+    if not v: raise ValueError(f'标的代码不能为空 / {field} must not be empty')
     if not SYMBOL_RE.fullmatch(v):
         raise ValueError(f'标的代码格式无效：只允许字母、数字和 . - _，以字母或数字开头，最长 {SYMBOL_MAX} 个字符 / '
                          f'Invalid {field} {v[:40]!r}: use letters, digits, ".", "-", "_" (start with a letter or digit, max {SYMBOL_MAX} chars)')
@@ -58,9 +59,6 @@ class Config(Model):
     minSlots: int = Field(4, ge=4, le=6)
     family: str = 'primary'
     dividendPV: float | None = Field(None, ge=0)
-    @field_validator('symbol','underlyingId',mode='before')
-    @classmethod
-    def strip_symbol(cls,v): return v.strip() if isinstance(v,str) else v
     @field_validator('exchangeTimezone')
     @classmethod
     def valid_zone(cls,v): ZoneInfo(v); return v
@@ -80,6 +78,13 @@ class Config(Model):
         if self.timeRule=='days365' and self.remainingDays is None: raise ValueError('请输入剩余天数')
         if self.minMinutes>self.maxMinutes: raise ValueError('统计窗口上限小于下限')
         return self
+class NewConfig(Config):
+    """Request body for creating a monitor: trims symbol/underlyingId before the other checks
+    (incl. the Futu allow-list). Stored configs are read with plain Config, which does NOT trim,
+    so a legacy payload re-validates to the same dict and its config hash is unchanged."""
+    @field_validator('symbol','underlyingId',mode='before')
+    @classmethod
+    def strip_symbol(cls,v): return v.strip() if isinstance(v,str) else v
 class Quote(Model):
     bid: float | None = None
     ask: float | None = None
