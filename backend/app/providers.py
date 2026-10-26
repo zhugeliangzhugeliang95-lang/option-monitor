@@ -55,7 +55,10 @@ class MockProvider:
     def rng(self,key): return random.Random(int(hashlib.sha256(f'{self.seed}:{self.at()}:{key}'.encode()).hexdigest()[:16],16))
     def spot(self,key): return {'SPY':600,'QQQ':510,'AAPL':230}.get(key,150)+self.rng(key).uniform(-.8,.8)
     def quote(self,key,mid,spread=.04):
-        at=self.at(); return Quote(bid=max(0,mid-spread/2),ask=mid+spread/2,last=mid,bidAt=at,askAt=at,lastAt=at,
+        # Prices and sequence stay per 10-second slot (reproducible); event times are the real clock,
+        # so a slot-floored time never looks up to 10 s old against the 5 s default maxAgeSeconds.
+        at=self.at(); now=self.clock()
+        return Quote(bid=max(0,mid-spread/2),ask=mid+spread/2,last=mid,bidAt=now,askAt=now,lastAt=now,
             bidSize=100,askSize=120,lastSize=10,source='deterministic-reference-mock',feedType='MOCK',sequence=f'{key}:{at.isoformat()}')
     async def get_capabilities(self): return Capabilities(provider='mock',configured=True,feedType='MOCK')
     async def get_market_state(self,cfg): return MarketState(marketOpen=True,optionSessionOpen=True,reason='MOCK_SYNTHETIC_SESSION')
