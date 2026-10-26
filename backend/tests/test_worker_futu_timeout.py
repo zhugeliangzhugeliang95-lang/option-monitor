@@ -295,7 +295,7 @@ async def test_12_stop_order_cancel_task_await_pending_then_close(make_worker, c
         order.append('pending returns'); gate.set()
         await stopping
         assert order == ['task cancelled', 'pending returns', 'context.close']
-        assert any(r.getMessage() == 'worker stopped' for r in caplog.records)
+        assert any(r.getMessage().startswith('worker stopped pid=') for r in caplog.records)
     finally:
         gate.set()
 

@@ -29,6 +29,35 @@
 | GET /api/exports/{monitorId} | 完整JSON审计，包括所有配置、快照、结果、分钟、统计、冻结和追加结果 |
 | GET /api/exports/{monitorId}?format=csv | 每个快照、每个口径各一行，含口径与配置hash |
 
+### 统计诊断字段 / Statistics diagnostic fields
+
+`GET /api/monitors/{id}/statistics`（以及统计SSE/持久化的StatisticalResult）新增以下**只增不改**字段；统计方法与严格资格规则不变。旧版本持久化的结果可能没有这些字段，客户端应视为可选。
+Additive, backward-compatible fields; the statistic and eligibility rules are unchanged. Results persisted before this version may lack them, so treat them as optional.
+
+| 字段 Field | 类型 Type | 含义 Meaning |
+|---|---|---|
+| reason | `{code, message, details?}` | 机器可读原因码 + 中英简短说明；details随code变化 / machine code + short text |
+| lastGapAt | UTC ISO字符串或null | 从asof前一分钟向前，第一个不可用分钟（无数据或槽位不足）；窗口(maxMinutes)全连续时为null；NO_DATA时为null |
+| consecutiveMinutes | int | 截至asof的连续可用分钟数（上限maxMinutes） |
+| neededMinutes | int | 所需连续分钟，即配置`minMinutes`（默认30） |
+| minSlotsPerMinute | int | 每分钟所需10秒槽位数，即配置`minSlots`（默认4） |
+
+`reason.code`：共9个（按优先级判定）/ 9 codes, evaluated in order:
+
+| code | 何时 When | details |
+|---|---|---|
+| OK | status=OK | — |
+| ZERO_SE / NONFINITE | 与status相同 / mirrors status | — |
+| NO_DATA | 当前流没有任何观测 / no observations | — |
+| DATA_STALE | asof前最近一个完整分钟没有任何观测（采集停止）/ no observation in the last closed minute | lastDataAt, minutesSinceLastData |
+| MISSING_EVENT_TIME | 窗口内观测全部不满足严格条件，且行原因中最常见为MISSING_EVENT_TIME | ineligibleRows, topReasons[{reason,count}], statuses[{status,count}] |
+| NOT_STRICT_ELIGIBLE | 窗口内全部不满足严格条件，其他原因（如会话关闭，见statuses）| 同上；最新一行会话关闭时另有`marketOpen:false` / same, plus `marketOpen:false` when the newest row's session is closed |
+| GAP_IN_WINDOW | 缺口之前存在可用分钟，连续分钟不足 / run broken by a gap | n, needed, missingMinutes, underfilledMinutes |
+| TOO_FEW_MINUTES | 采集时间尚短或分钟槽位不足 / not enough minutes yet | n, needed, missingMinutes, underfilledMinutes |
+
+原因计数仅在整个窗口都不合格时用SQLite `json_each`读取已存储的`modes.<mode>.rows[*].reasons`与聚合`status`，不解码完整payload。
+Reason counts are read from stored row reasons and aggregate statuses via SQLite `json_each`, only when the whole window is ineligible.
+
 CSV/TSV列：strike, call_bid, call_ask, call_last, put_bid, put_ask, put_last，以及可选call_reportedMid/put_reportedMid。每个价格可对应`call_bidAt`等事件时间列。缺少时间戳仍可原始计算，但不通过质量。metadata应包含valuationAt、expiration、underlying；可选pricingAt、lastTradingAt、exerciseCutoffAt和人工历史时段声明。导入JSON结构见samples/manual.json。
 
 ## 自定义HTTP行情协议v1

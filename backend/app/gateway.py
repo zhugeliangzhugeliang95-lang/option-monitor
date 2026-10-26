@@ -2,6 +2,8 @@
 from fastapi import FastAPI, HTTPException
 from .providers import MockProvider
 from .models import Config
+from .logs import configure as _configure_logging
+_configure_logging()  # uvicorn configures its loggers before importing the app; wrap them with redaction
 app=FastAPI(title='MOCK reference quote gateway'); provider=MockProvider(); catalog={}
 @app.get('/v1/capabilities')
 async def capabilities(): return await provider.get_capabilities()
