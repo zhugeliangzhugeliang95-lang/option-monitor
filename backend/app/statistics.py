@@ -78,15 +78,17 @@ def explain(observations,blocks,result,asof,cfg,reason_counts=None):
         times=[datetime.fromisoformat(o['at']) for o in observations]
         idx=[i for i,t in enumerate(times) if start<=t<end]; window=[observations[i] for i in idx]
         last=max(times) if times else None
-        if not observations: code='NO_DATA'
+        if not observations: code='NO_DATA'; out['lastGapAt']=None   # nothing collected: no meaningful gap
         elif last<end-timedelta(minutes=STALE_AFTER_MINUTES):
             code='DATA_STALE'; details=dict(lastDataAt=last.astimezone(timezone.utc).isoformat(),minutesSinceLastData=int((end-last).total_seconds()//60))
         elif window and not any(o['eligible'] and o['dBps'] is not None for o in window):
-            reasons,statuses=reason_counts(idx) if reason_counts else ({},{})
+            counted=reason_counts(idx) if reason_counts else ({},{})
+            reasons,statuses=counted[0],counted[1]; market=counted[2] if len(counted)>2 else None
             top=sorted(reasons.items(),key=lambda kv:(-kv[1],kv[0]))[:3]
             code='MISSING_EVENT_TIME' if top and top[0][0]=='MISSING_EVENT_TIME' else 'NOT_STRICT_ELIGIBLE'
             details=dict(ineligibleRows=len(window),topReasons=[dict(reason=k,count=v) for k,v in top],
                          statuses=[dict(status=k,count=v) for k,v in sorted(statuses.items(),key=lambda kv:(-kv[1],kv[0]))[:3]])
+            if code=='NOT_STRICT_ELIGIBLE' and market is False: details['marketOpen']=False   # session closed
         else:
             mins=[start+timedelta(minutes=i) for i in range(cfg.maxMinutes)]
             details=dict(missingMinutes=sum(1 for m in mins if m not in blocks),underfilledMinutes=sum(1 for m in mins if m in blocks and blocks[m]['value'] is None))

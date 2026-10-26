@@ -81,14 +81,17 @@ def statistics_for(db,m,asof,mode=None):
 def reason_counts(db,ids,mode):
     """Most common stored ineligibility reasons for the given aggregate rows (SQL json_each, no payload decoding)."""
     m=mode.replace('"','').replace("'",'')
-    if not ids: return Counter(),Counter()
+    if not ids: return Counter(),Counter(),None
     marks=','.join(str(int(i)) for i in ids)
     reasons=db.execute(text(f"""select r.value,count(*) from aggregate_results a,
         json_each(json_extract(a.payload,'$.modes."{m}".rows')) row, json_each(json_extract(row.value,'$.reasons')) r
         where a.id in ({marks}) group by r.value""")).all()
     statuses=db.execute(text(f"""select json_extract(payload,'$.status'),count(*) from aggregate_results
         where id in ({marks}) and json_extract(payload,'$.status')!='OK' group by 1""")).all()
-    return Counter(dict(reasons)),Counter(dict(statuses))
+    # Session flag of the newest row in the window (raw snapshot; one row only).
+    market=db.execute(text(f"""select json_extract(r.payload,'$.marketOpen') from aggregate_results a join raw_snapshots r on r.id=a.snapshot_id
+        where a.id={max(int(i) for i in ids)}""")).scalar()
+    return Counter(dict(reasons)),Counter(dict(statuses)),(None if market is None else bool(market))
 
 def persist_statistics(db,asof):
     groups={}; results=[]

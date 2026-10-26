@@ -40,6 +40,7 @@ def test_no_data(cfg,at):
     with Session() as db:
         m=create_monitor(db,cfg); s=check(statistics_for(db,m,at),'NO_DATA',cfg)
     assert s['consecutiveMinutes']==0 and s['status']=='INSUFFICIENT_SAMPLES'
+    assert s['lastGapAt'] is None   # nothing collected: no gap to report
 
 def test_data_stale(cfg,sample,at):
     with Session() as db:
@@ -73,6 +74,7 @@ def test_missing_event_time(cfg,sample,at):
         m=seed(db,cfg,sample,at,35,edit=strip_times); s=check(statistics_for(db,m,at+timedelta(minutes=35)),'MISSING_EVENT_TIME',cfg)
     d=s['reason']['details']
     assert d['topReasons'][0]['reason']=='MISSING_EVENT_TIME' and d['ineligibleRows']==140
+    assert 'marketOpen' not in d
 
 def test_not_strict_eligible(cfg,sample,at):
     with Session() as db:
@@ -81,6 +83,7 @@ def test_not_strict_eligible(cfg,sample,at):
     d=s['reason']['details']
     # Rows carry no reasons for a closed session; the aggregate status explains it (manual feed status wins in engine).
     assert d['topReasons']==[] and d['ineligibleRows']==140 and d['statuses']==[{'status':'MANUAL_PRICE_ONLY','count':140}]
+    assert d['marketOpen'] is False   # session closed is visible to the user
 
 def test_zero_se(cfg,sample,at):
     with Session() as db:

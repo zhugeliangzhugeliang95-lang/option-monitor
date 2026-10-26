@@ -37,12 +37,12 @@ Additive, backward-compatible fields; the statistic and eligibility rules are un
 | 字段 Field | 类型 Type | 含义 Meaning |
 |---|---|---|
 | reason | `{code, message, details?}` | 机器可读原因码 + 中英简短说明；details随code变化 / machine code + short text |
-| lastGapAt | UTC ISO字符串或null | 从asof前一分钟向前，第一个不可用分钟（无数据或槽位不足）；窗口(maxMinutes)全连续时为null |
+| lastGapAt | UTC ISO字符串或null | 从asof前一分钟向前，第一个不可用分钟（无数据或槽位不足）；窗口(maxMinutes)全连续时为null；NO_DATA时为null |
 | consecutiveMinutes | int | 截至asof的连续可用分钟数（上限maxMinutes） |
 | neededMinutes | int | 所需连续分钟，即配置`minMinutes`（默认30） |
 | minSlotsPerMinute | int | 每分钟所需10秒槽位数，即配置`minSlots`（默认4） |
 
-`reason.code`（按优先级判定 / evaluated in order）:
+`reason.code`：共9个（按优先级判定）/ 9 codes, evaluated in order:
 
 | code | 何时 When | details |
 |---|---|---|
@@ -51,7 +51,7 @@ Additive, backward-compatible fields; the statistic and eligibility rules are un
 | NO_DATA | 当前流没有任何观测 / no observations | — |
 | DATA_STALE | asof前最近一个完整分钟没有任何观测（采集停止）/ no observation in the last closed minute | lastDataAt, minutesSinceLastData |
 | MISSING_EVENT_TIME | 窗口内观测全部不满足严格条件，且行原因中最常见为MISSING_EVENT_TIME | ineligibleRows, topReasons[{reason,count}], statuses[{status,count}] |
-| NOT_STRICT_ELIGIBLE | 窗口内全部不满足严格条件，其他原因（如会话关闭，见statuses）| 同上 / same |
+| NOT_STRICT_ELIGIBLE | 窗口内全部不满足严格条件，其他原因（如会话关闭，见statuses）| 同上；最新一行会话关闭时另有`marketOpen:false` / same, plus `marketOpen:false` when the newest row's session is closed |
 | GAP_IN_WINDOW | 缺口之前存在可用分钟，连续分钟不足 / run broken by a gap | n, needed, missingMinutes, underfilledMinutes |
 | TOO_FEW_MINUTES | 采集时间尚短或分钟槽位不足 / not enough minutes yet | n, needed, missingMinutes, underfilledMinutes |
 
