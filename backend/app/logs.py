@@ -75,7 +75,13 @@ _EQ=re.compile(r"""("""+_NAME+r""")=([^&\s,;)'"}\]]+)""")  # also inside quoted 
 _SPACED=re.compile(r"""(?i)\b(password|passwd|pwd|pw|token|secret)(\s+)(?!=|:)([^\s,;'"]+)""")
 _ACCOUNT_NUM=re.compile(r"""(?i)\b(acc(?:ount)?|acct)((?:[_-]?(?:id|no|number))?['"]?[\s:=#'"]*)(\d{4,})""")
 _SCHEME_TOKEN=re.compile(r'(?i)\b(bearer|basic)\s+(?!\*\*\*)[A-Za-z0-9._~+/=-]{6,}')
-_URL_CREDS=re.compile(r'(?i)(\b[a-z][a-z0-9+.-]{0,15}://)[^/\s:@]{1,256}:[^/\s@]{1,256}@')
+_URL_CREDS=re.compile(r'(?i)(\b[a-z][a-z0-9+.-]{0,15}://)[^/\s:@]{0,256}:[^/\s@]{1,256}@')
+# Applied only to a head cut by truncation: `scheme://user:pa` with the `@` dropped must not leak the
+# password prefix. Masked to the end of the head (not applied to untruncated text, so a plain
+# `http://host:8080` at the end of a message stays readable).
+_URL_CREDS_CUT=re.compile(r'(?i)(\b[a-z][a-z0-9+.-]{0,15}://)[^/\s:@]{0,256}:[^/\s@]*\Z')
+def _cut(head):
+    return _URL_CREDS_CUT.sub(lambda m: m.group(1)+MASK,head)
 
 def _kv_scan(text):
     """Mask sensitive `name<sep>value`. If the name is not sensitive, only the name is consumed and
@@ -100,12 +106,12 @@ def redact(text):
     to the end of the kept head."""
     text=str(text); cut=''
     if len(text)>MAX_TOTAL:
-        cut=f'...[truncated {len(text)-MAX_TOTAL} chars]'; text=text[:MAX_TOTAL]
+        cut=f'...[truncated {len(text)-MAX_TOTAL} chars]'; text=_cut(text[:MAX_TOTAL])
     return _redact_lines(text)+cut
 
 def _redact_lines(text):
     if len(text)>MAX_LINE and any(len(l)>MAX_LINE for l in text.split('\n')):
-        return '\n'.join(_redact(l) if len(l)<=MAX_LINE else _redact(l[:MAX_LINE])+f'...[truncated {len(l)-MAX_LINE} chars]'
+        return '\n'.join(_redact(l) if len(l)<=MAX_LINE else _redact(_cut(l[:MAX_LINE]))+f'...[truncated {len(l)-MAX_LINE} chars]'
                          for l in text.split('\n'))
     return _redact(text)
 

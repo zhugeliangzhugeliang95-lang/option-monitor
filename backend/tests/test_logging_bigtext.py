@@ -70,3 +70,44 @@ def test_long_names_linear():
 
 def test_truncate_then_redact_documented():
     assert 'TRUNCATE THEN REDACT' in logs.redact.__doc__
+
+# Round 5: URL credentials cut by truncation before the '@' (64KB record cap and 8192 line cap).
+URL_FORMS=['https://u:{s}@h/x','http://user:{s}@host:8080/p?q=1','postgresql://admin:{s}@db.local/x',
+           'redis://:{s}@r:6379/0','mysql+pymysql://u.name:{s}@h','ftp://u-1:{s}@h',
+           "url='https://u:{s}@h/x'",'dsn="amqp://guest:{s}@mq//"','see <https://u:{s}@h>','proxy=socks5://u:{s}@p:1080']
+
+def _no_leak(out):
+    for k in range(4,len(SECRET)+1):
+        assert SECRET[:k] not in out, (k,out[-120:])
+
+@pytest.mark.parametrize('form',URL_FORMS)
+def test_url_creds_no_leak_at_total_cap_multiline(form):
+    pre=form.index('{s}')
+    for off in range(65500,65541):          # secret start offset, cut lands before/inside/after it
+        n=off-pre; pad='a=b\n'*(n//4)+' '*(n%4)   # real multi-line padding: only the 64KB cap applies
+        s=pad+form.format(s=SECRET)+'\ntail=1\n'+'a=b\n'*20
+        assert len(s)>MAX_TOTAL and s.index(SECRET)==off
+        _no_leak(redact(s))
+
+@pytest.mark.parametrize('form',URL_FORMS)
+def test_url_creds_no_leak_at_line_cap_multiline(form):
+    pre=form.index('{s}')
+    for off in range(8170,8201):            # secret start offset within one over-long line
+        n=off-pre; line='q '*(n//2)+' '*(n%2)+form.format(s=SECRET)+' more'*10
+        s='a=b\n'*50+line+'\nnext=1\n'+'a=b\n'*50
+        assert line.index(SECRET)==off and len(line)>logs.MAX_LINE
+        out=redact(s); _no_leak(out); assert 'next=1' in out
+
+def test_url_cut_marker_and_untruncated_unchanged():
+    s='a=b\n'*16380+'https://u:hunter2SECRETzz@h/x'
+    out=redact(s)
+    assert 'https://'+MASK in out and '[truncated' in out
+    assert redact('connect http://127.0.0.1:11111')=='connect http://127.0.0.1:11111'
+    assert redact('redis://:hunter2SECRETzz@r:6379')=='redis://***:***@r:6379'
+
+@pytest.mark.parametrize('form',URL_FORMS)
+def test_url_boundary_fast(form):
+    s='a=b\n'*16376+form.format(s=SECRET)+'\n'+'a=b\n'*20000
+    assert best_ms(s)<50
+    s=('q '*4090+form.format(s=SECRET)+'\n')*13
+    assert best_ms(s)<50
