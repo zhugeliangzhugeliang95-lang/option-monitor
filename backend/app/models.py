@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Literal
@@ -8,6 +9,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 Basis = Literal['BID','ASK','MID','LAST']
 Feed = Literal['REALTIME','DELAYED','INDICATIVE','MANUAL','MOCK','UNKNOWN']
+SYMBOL_MAX=20
+SYMBOL_RE=re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,%d}'%(SYMBOL_MAX-1))
+def check_symbol(value,field='symbol'):
+    """Format check for a NEW or CHANGED symbol/underlyingId (create, or update that changes it).
+    Not applied when reading stored configs, so legacy monitors with odd symbols keep working."""
+    v=value.strip() if isinstance(value,str) else value
+    if not isinstance(v,str) or not v: raise ValueError(f'标的代码不能为空 / {field} must not be empty')
+    if not SYMBOL_RE.fullmatch(v):
+        raise ValueError(f'标的代码格式无效：只允许字母、数字和 . - _，以字母或数字开头，最长 {SYMBOL_MAX} 个字符 / '
+                         f'Invalid {field} {v[:40]!r}: use letters, digits, ".", "-", "_" (start with a letter or digit, max {SYMBOL_MAX} chars)')
+    return v
 def utcnow(): return datetime.now(timezone.utc)
 class Model(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
@@ -46,6 +58,9 @@ class Config(Model):
     minSlots: int = Field(4, ge=4, le=6)
     family: str = 'primary'
     dividendPV: float | None = Field(None, ge=0)
+    @field_validator('symbol','underlyingId',mode='before')
+    @classmethod
+    def strip_symbol(cls,v): return v.strip() if isinstance(v,str) else v
     @field_validator('exchangeTimezone')
     @classmethod
     def valid_zone(cls,v): ZoneInfo(v); return v
