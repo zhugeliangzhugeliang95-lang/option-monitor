@@ -9,6 +9,7 @@ from .providers import provider_for, ProviderError, regular_session, exchange_da
 from .service import save_snapshot, persist_statistics
 from . import retention
 from . import futu_config
+from . import models
 from .logs import configure as configure_logging
 log=logging.getLogger('app.worker')
 # Plan item 1, section E: statuses that are not failures (no failure count, no backoff, retry 10 s)
@@ -24,7 +25,7 @@ class Worker:
         while self.running:
             with Session() as db:
                 state=db.get(WorkerState,'singleton') or WorkerState(id='singleton',payload={})
-                state.payload={'heartbeatAt':nowstr(),'pid':os.getpid(),'targetSeconds':10}; db.add(state); db.commit()
+                state.payload={'heartbeatAt':nowstr(),'pid':os.getpid(),'targetSeconds':models.CYCLE_SECONDS}; db.add(state); db.commit()
             await asyncio.sleep(2)
     async def collect(self,mid,rc,underlying=None,pre_error=None,prepared=None,chain_meta=None):
         lock=self.locks.setdefault(mid,asyncio.Lock())
@@ -76,7 +77,7 @@ class Worker:
                     mid,cfg.provider,cfg.underlyingId,time.monotonic()-started,self.failures[mid])
             duration=time.monotonic()-started
             if duration>=10: log.warning('slow collect monitor=%s symbol=%s status=%s duration=%.3fs',mid,cfg.underlyingId,status,duration)
-            self.next_due[mid]=time.monotonic()+max(10-(time.time()%10),retry)
+            self.next_due[mid]=time.monotonic()+max(models.CYCLE_SECONDS-(time.time()%models.CYCLE_SECONDS),retry)
             with Session() as db:
                 db.add(record(ProviderStatus,mid,rc.id,{'status':status,'operation':operation,'durationSeconds':duration,'retryAfter':retry,'delayed':duration>=10 or retry>0,'at':nowstr(),**extra}))
                 db.add(ResultOutbox(payload={'type':'provider','monitorId':mid,'status':status},created_at=nowstr())); db.commit()

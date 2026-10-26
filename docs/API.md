@@ -29,6 +29,27 @@
 | GET /api/exports/{monitorId} | 完整JSON审计，包括所有配置、快照、结果、分钟、统计、冻结和追加结果 |
 | GET /api/exports/{monitorId}?format=csv | 每个快照、每个口径各一行，含口径与配置hash |
 
+### 新鲜度字段 / Freshness fields（只读，纯加法）
+
+| JSON 路径 | 类型 | 是否总是存在 | 含义 |
+|---|---|---|---|
+| `GET /api/providers/status` → `cycleSeconds` | 整数 | 总是存在（即使没有 worker 心跳，`worker` 为 `null` 时也返回） | worker 目标采集周期（秒）。与心跳 `worker.targetSeconds` 同一来源（`app/models.py` 的 `CYCLE_SECONDS`，当前 10），不读取心跳；无心跳时即该默认值 |
+| `GET /api/results/latest` → `<monitorId>.staleAfterSeconds` | 整数 | 有结果的监测总是存在；`?summary=1` 响应中不出现 | `ceil(max(maxAgeSeconds, 2 × cycleSeconds))`；`maxAgeSeconds` 取产生该结果的配置版本（旧配置结果用旧配置）。默认 maxAgeSeconds=5 时为 20 |
+
+仅供前端判断「历史 / 过旧快照」的显示阈值；不改变 `maxAgeSeconds` 本身、报价质量判定、config hash/configId 或统计窗口。`/api/monitors/{id}/history`、`/api/snapshots/{id}`、`summary=1` 不变。旧前端可忽略；新前端缺字段时回退 `max(maxAgeSeconds, 20)`。
+
+真实运行示例（临时库、MOCK、`python -m app.worker` 实跑；SPY 监测 maxAgeSeconds=5，节选字段）：
+
+```json
+// GET /api/providers/status（节选）
+{"cycleSeconds": 10, "worker": {"heartbeatAt": "2026-10-26T12:15:07.645730+00:00", "pid": 280497, "targetSeconds": 10}, "workerStatus": "RUNNING", "monitors": {...}}
+
+// GET /api/results/latest（节选）
+{"9263556b78f1423d99402abf85f44069": {"valuationAt": "2026-10-26T12:15:00.041056+00:00", "status": "OK", "anchorStrictEligible": true, "staleAfterSeconds": 20, ...}}
+```
+
+无 worker 心跳时：`{"cycleSeconds": 10, "worker": null, "workerStatus": "INTERRUPTED", ...}`；maxAgeSeconds=30 的监测 `staleAfterSeconds` 为 30。
+
 ### 统计诊断字段 / Statistics diagnostic fields
 
 `GET /api/monitors/{id}/statistics`（以及统计SSE/持久化的StatisticalResult）新增以下**只增不改**字段；统计方法与严格资格规则不变。旧版本持久化的结果可能没有这些字段，客户端应视为可选。
