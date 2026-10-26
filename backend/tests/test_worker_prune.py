@@ -62,16 +62,24 @@ def test_futu_inflight_is_not_pruned():
     assert all('batch' not in getattr(w, n) for n in DICTS)
 
 
-def test_inflight_futu_batch_survives_cycle_after_delete(make_worker):
+def test_inflight_futu_batch_survives_cycle_after_delete(make_worker, monkeypatch):
     async def go():
         w, ids, ctx, mono = make_worker(n_futu=1)
         mid = ids['futu'][0]
+        # Hold the fake batch explicitly; a fast executor may otherwise finish before cycle returns.
+        release = asyncio.Event()
+        original = w.providers['futu'].collect_batch
+        async def held(configs):
+            await release.wait()
+            return await original(configs)
+        monkeypatch.setattr(w.providers['futu'], 'collect_batch', held)
         w.next_due.clear()
         await w.cycle()
         assert mid in w.futu_inflight
         deactivate(mid)
         await w.cycle()  # batch still running: state kept
         assert mid in w.futu_inflight or mid in w.last_status
+        release.set()
         await asyncio.wait({w.futu_task})
         assert mid in w.last_status
         await w.cycle()  # batch finished, monitor inactive: pruned

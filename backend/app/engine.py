@@ -5,7 +5,8 @@ from math import exp, isfinite
 from statistics import mean, median, stdev
 from zoneinfo import ZoneInfo
 from .models import Config, Quote, Snapshot
-MODEL_VERSION = 'parity-base-v1'
+from .expiry import nearest_expiration, reference_close
+MODEL_VERSION = 'parity-base-v2-nearest'
 BASES = ['BID','ASK','MID','LAST','CUSTOM']
 def price_selector(q: Quote, basis: str):
     if q.unit != 'PER_SHARE': return None
@@ -58,8 +59,9 @@ def summary(rows,requested):
 def compute(cfg:Config,s:Snapshot):
     req=cfg.nBelow+cfg.nAbove
     localday=s.valuationAt.astimezone(ZoneInfo(cfg.exchangeTimezone)).date().isoformat()
-    expiry=localday if cfg.expiryMode=='sameDay' else cfg.expiration
     catalog=s.contracts or [l.contract for l in s.legs]
+    expiry=(s.selectedExpiration or nearest_expiration(cfg,[c.expiration for c in catalog if c.underlyingId==cfg.underlyingId],s.valuationAt)) if cfg.expiryMode=='nearest' else (localday if cfg.expiryMode=='sameDay' else cfg.expiration)
+    pricing_reference=reference_close(cfg.calendar,expiry) if cfg.timeRule=='expiryClose' and expiry else None
     catalog=[c for c in catalog if c.underlyingId==cfg.underlyingId and c.expiration==expiry]
     anchor=price_selector(s.underlying,'LAST')
     anchor_errors=quality(s.underlying,'LAST',s.valuationAt,cfg)
@@ -86,9 +88,9 @@ def compute(cfg:Config,s:Snapshot):
                 if c.quote.unit!='PER_SHARE' or p.quote.unit!='PER_SHARE': fatal.append('UNIT_ERROR')
                 if cfg.timeRule=='days365': T=cfg.remainingDays/365
                 else:
-                    end=c.contract.pricingAt or cfg.pricingAt
+                    end=c.contract.pricingAt or (pricing_reference if cfg.timeRule=='expiryClose' else cfg.pricingAt)
                     if not end: fatal.append('MISSING_PRICING_TIME')
-                    elif not c.contract.pricingAt and not cfg.timeAssumption: fatal.append('EXPLICIT_TIME_ASSUMPTION_REQUIRED')
+                    elif cfg.timeRule!='expiryClose' and not c.contract.pricingAt and not cfg.timeAssumption: fatal.append('EXPLICIT_TIME_ASSUMPTION_REQUIRED')
                     else:
                         T=(end-s.valuationAt).total_seconds()/(365*86400)
                         if T<0: fatal.append('EXPIRED')
@@ -118,6 +120,7 @@ def compute(cfg:Config,s:Snapshot):
         a.update(rawGapBps=10000*(a['rawMean']-ref)/ref if a['rawMean'] is not None and ref is not None and ref>0 else None,rows=rows,strictEligible=strict,dBps=10000*(a['validatedMean']-ref)/ref if strict else None,callBasis=cb,putBasis=pb,stockBasis=cfg.stockReferenceBasis)
         modes[mode]=a
     status='PLEASE_SET_COUNTS' if req==0 else ('NO_SAME_DAY_EXPIRY' if not catalog else ('MISSING_ANCHOR' if anchor is None else 'OK'))
+    if not catalog and cfg.expiryMode=='nearest' and req>0: status='NO_AVAILABLE_EXPIRY'
     # A fixed expiration before the valuation's exchange date is reported, never substituted.
     if cfg.expiryMode!='sameDay' and expiry and expiry<localday and status in ('OK','NO_SAME_DAY_EXPIRY','MISSING_ANCHOR'): status='EXPIRED'
     if status=='OK' and anchor_errors: status='INVALID_SELECTION_ANCHOR'
@@ -126,8 +129,8 @@ def compute(cfg:Config,s:Snapshot):
     if status=='OK' and (not s.marketOpen or not s.optionSessionOpen): status='CLOSED_OR_UNKNOWN_SESSION'
     if status=='OK' and not modes[cfg.optionPricePreset]['strictEligible']: status='PARTIAL_OR_INELIGIBLE'
     return dict(modelVersion=MODEL_VERSION,valuationAt=s.valuationAt.isoformat(),expiration=expiry,tradingDay=localday,
-        status=status,anchor=anchor,anchorStrictEligible=not anchor_errors,stockReference=ref,modes=modes,
+        expiryMode=cfg.expiryMode,pricingReferenceAt=pricing_reference.isoformat() if pricing_reference else None,status=status,anchor=anchor,anchorStrictEligible=not anchor_errors,stockReference=ref,modes=modes,
         composition=[str(k) for k,_ in selected],feedType=s.underlying.feedType,marketReason=s.marketReason,
-        warnings=['人工假设，非实时利率','盘口区间不是统计置信区间；grossGap不是保证可实现的套利收益']+
+        warnings=([f'定价时间假设：采用所选到期日的交易所常规收盘时间（含半日市），非期权实际截止时刻；{pricing_reference.isoformat() if pricing_reference else "尚未确定"}'] if cfg.timeRule=='expiryClose' else [])+['人工假设，非实时利率','盘口区间不是统计置信区间；grossGap不是保证可实现的套利收益']+
         (['简化平价近似，提前行权未建模'] if any(c.exercise=='AMERICAN' for c in catalog) else [])+
         (['未知股息，未作股息修正'] if cfg.dividendPV is None else ['独立股息修正版 parity-dividend-v1']))

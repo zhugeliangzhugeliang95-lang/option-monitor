@@ -1,11 +1,4 @@
 export type Obj=Record<string,any>;
-// 统计接口：reason / lastGapAt 为后端可选字段，前端不依赖其存在
-export type StatsReason=string|{code:string;message?:string;details?:unknown}|null;
-export type Statistics=Obj&{reason?:StatsReason;lastGapAt?:string|null;consecutiveMinutes?:number;neededMinutes?:number;minSlotsPerMinute?:number};
-// 统计 reason.code → 界面文案（以 code 为准；后端 message 仅作未知 code 兜底；details 不显示）。对照 backend/app/statistics.py REASON_TEXT 与 docs/API.md
-export const reasonLabels:Record<string,string>={NO_DATA:'暂无数据：当前数据流还没有采集到观测',DATA_STALE:'数据已停止更新：最近一个完整分钟没有观测（采集可能已中断）',GAP_IN_WINDOW:'窗口内有缺口：连续分钟被中断，需重新累计',TOO_FEW_MINUTES:'连续分钟不足：采集时间尚短或部分分钟槽位不足',MISSING_EVENT_TIME:'行情缺少事件时间，不满足严格条件',NOT_STRICT_ELIGIBLE:'观测不满足严格条件（如休市 / 会话关闭）',ZERO_SE:'标准误为零，无法检验',NONFINITE:'数据中存在非有限值'};
-// 兼容字符串与对象；code=OK 不视为问题（返回空）
-export const reasonText=(r:unknown):string=>{if(r==null||r==='')return '';if(typeof r==='string')return r==='OK'?'':reasonLabels[r]||r;if(typeof r==='object'){const o=r as {code?:unknown;message?:unknown};const code=typeof o.code==='string'?o.code:'';if(code==='OK')return '';if(code&&reasonLabels[code])return reasonLabels[code];if(typeof o.message==='string'&&o.message)return o.message;return code;}return '';};
 const isNum=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v);
 export const numOr=(v:unknown,d:number)=>isNum(v)?v:d;
 /** 「过旧快照」阈值（秒）。优先结果里的 staleAfterSeconds（后端 = max(maxAgeSeconds, 2×cycleSeconds)）；
@@ -20,7 +13,7 @@ export const focusSymbols=['TSLA','NVDA','META','AMZN','GOOGL','AAPL','MSFT'];
 export const focusRank=(m:Obj)=>{const rank=focusSymbols.indexOf(m.config.symbol);return rank<0?focusSymbols.length:rank;};
 export const bases=['BID','ASK','MID','LAST','CUSTOM'];
 export const labels:Obj={BID:'买一',ASK:'卖一',MID:'中间价',LAST:'最新成交',CUSTOM:'自定义'};
-export const statusLabels:Obj={FUTU_RIGHTS_READY:'富途权限就绪 · 等待报价核验',FUTU_OPTION_PERMISSION_REQUIRED:'缺少 OpenAPI 美股期权权限',FUTU_STOCK_PERMISSION_REQUIRED:'缺少 OpenAPI 美股正股权限',OPEND_OFFLINE:'OpenD 未启动或无法连接',OPEND_LOGIN_REQUIRED:'请登录 OpenD 并完成协议',FUTU_SDK_MISSING:'富途 SDK 未安装',FUTU_BUSY:'富途请求处理中',FUTU_REQUEST_FAILED:'富途请求失败',CONTRACT_METADATA_MISMATCH:'合约资料不匹配',UNSUPPORTED_SYMBOL:'不在已配置的美股/ETF标的中',EXPIRED:'合约已过期',MANUAL_PRICE_ONLY:'人工快照 · 价格计算',CLOSED_OR_UNKNOWN_SESSION:'休市 / 交易时段未确认',PAUSED:'采集已暂停',PLEASE_SET_COUNTS:'请设置选档数量',NO_SAME_DAY_EXPIRY:'今天没有可用到期期权',PARTIAL_OR_INELIGIBLE:'部分档位 / 质量未通过',INVALID_SELECTION_ANCHOR:'选档成交价过旧或缺时间',MISSING_ANCHOR:'缺少选档成交价',NOT_CONFIGURED:'未配置 API',WAITING_WORKER:'等待采集',MANUAL_INPUT_REQUIRED:'等待人工输入',RATE_LIMITED:'供应商限流',TIMEOUT:'请求超时',PERMISSION_DENIED:'行情权限不足',CONNECTION_OR_PROTOCOL_ERROR:'行情连接中断',INSUFFICIENT_SAMPLES:'样本积累中',ZERO_SE:'方差为零 / SE 过小',OK:'计算完成',OPEND_UNRESPONSIVE:'OpenD 无响应，未重建连接，请检查 OpenD',CHAIN_WARMING:'期权链加载中，稍后出数',CHAIN_WARMING_OFF_HOURS:'盘外，等待开盘前预热（约 09:00 美东）',CHAIN_UNAVAILABLE:'期权链长时间无法获取，请检查权限或 OpenD'};
+export const statusLabels:Obj={FUTU_RIGHTS_READY:'富途权限就绪 · 等待报价核验',FUTU_OPTION_PERMISSION_REQUIRED:'缺少 OpenAPI 美股期权权限',FUTU_STOCK_PERMISSION_REQUIRED:'缺少 OpenAPI 美股正股权限',OPEND_OFFLINE:'OpenD 未启动或无法连接',OPEND_LOGIN_REQUIRED:'请登录 OpenD 并完成协议',FUTU_SDK_MISSING:'富途 SDK 未安装',FUTU_BUSY:'富途请求处理中',FUTU_REQUEST_FAILED:'富途请求失败',CONTRACT_METADATA_MISMATCH:'合约资料不匹配',UNSUPPORTED_SYMBOL:'不在已配置的美股/ETF标的中',EXPIRED:'合约已过期',MANUAL_PRICE_ONLY:'人工快照 · 价格计算',CLOSED_OR_UNKNOWN_SESSION:'休市 / 交易时段未确认',PAUSED:'采集已暂停',PLEASE_SET_COUNTS:'请设置选档数量',NO_AVAILABLE_EXPIRY:'暂无有效到期合约',NO_SAME_DAY_EXPIRY:'今天没有可用到期期权',PARTIAL_OR_INELIGIBLE:'部分档位 / 质量未通过',INVALID_SELECTION_ANCHOR:'选档成交价过旧或缺时间',MISSING_ANCHOR:'缺少选档成交价',NOT_CONFIGURED:'未配置 API',WAITING_WORKER:'等待采集',MANUAL_INPUT_REQUIRED:'等待人工输入',RATE_LIMITED:'供应商限流',TIMEOUT:'请求超时',PERMISSION_DENIED:'行情权限不足',CONNECTION_OR_PROTOCOL_ERROR:'行情连接中断',OK:'计算完成',OPEND_UNRESPONSIVE:'OpenD 无响应，未重建连接，请检查 OpenD',CHAIN_WARMING:'期权链加载中，稍后出数',CHAIN_WARMING_OFF_HOURS:'盘外，等待开盘前预热（约 09:00 美东）',CHAIN_UNAVAILABLE:'期权链长时间无法获取，请检查权限或 OpenD'};
 // ---- Futu 超时方案 v5「用户可见状态（最终）」前端准备：后端字段全部可选，没有时不显示任何新东西 ----
 export type ChainLastError={code?:string;ret?:number|string;at?:string};
 export type ChainInfo={state?:'warming'|'unavailable'|(string&{});reason?:'queued'|'retrying'|'offHours'|(string&{});stale?:boolean;ageSeconds?:number;fetchedAt?:string;refreshFailures?:number;expirationsStale?:boolean;waitingSeconds?:number;attempts?:number;lastError?:ChainLastError|null;droppedReason?:'MAX_AGE'|(string&{})};
@@ -75,7 +68,25 @@ export const ZONE_KEY='option-monitor.zone';
 export const browserZone=()=>{try{return Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';}catch{return 'UTC';}};
 // 空/非法 → —；纯日期原样；无时区的时间戳按 UTC 解析；附带时区缩写（取不到则用 IANA 名）
 export function formatTime(v:any,zone:string){if(v==null||v==='')return '—';if(typeof v==='string'){const s=v.trim();if(/^\d{4}-\d{2}-\d{2}$/.test(s))return s;const h=s.match(/^(.*T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)([+-]\d{2})$/);v=h?`${h[1]}${h[2]}:00`:/T\d{2}:\d{2}/.test(s)&&!/(Z|[+-]\d{2}:?\d{2})$/i.test(s)?s+'Z':s;}const d=new Date(v);if(Number.isNaN(d.getTime()))return '—';try{const text=d.toLocaleString('zh-CN',{timeZone:zone,hour12:false});const abbr=new Intl.DateTimeFormat('en-US',{timeZone:zone,timeZoneName:'short'}).formatToParts(d).find(p=>p.type==='timeZoneName')?.value;return `${text} ${abbr||zone}`;}catch{return '—';}}
-export async function api(path:string,body?:unknown,method?:string){const r=await fetch('/api'+path,{method:method||(body?'POST':'GET'),headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const text=await r.text();let data:any;try{data=text?JSON.parse(text):null;}catch{throw new Error(`HTTP ${r.status} ${r.statusText||''}`.trim());}if(!r.ok)throw new Error(typeof data?.detail==='string'?data.detail:Array.isArray(data?.detail)?readableDetail(data.detail):data?.detail!==undefined?JSON.stringify(data.detail):`HTTP ${r.status} ${r.statusText||''}`.trim());return data;}
+export async function api(path:string,body?:unknown,method?:string){
+ const verb=(method||(body?'POST':'GET')).toUpperCase();
+ // Retry reads once only. A lost write response must never replay a mutation.
+ for(let attempt=0;;attempt++){
+  let r:Response,text:string;
+  try{
+   r=await fetch('/api'+path,{method:verb,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+   text=await r.text();
+  }catch(e){
+   if(verb==='GET'&&attempt===0&&e instanceof TypeError){await new Promise(resolve=>setTimeout(resolve,250));continue;}
+   throw e;
+  }
+  if(verb==='GET'&&attempt===0&&[500,502,503,504].includes(r.status)){await new Promise(resolve=>setTimeout(resolve,250));continue;}
+  let data:any;
+  try{data=text?JSON.parse(text):null;}catch{throw new Error(`HTTP ${r.status} ${r.statusText||''}`.trim());}
+  if(!r.ok)throw new Error(typeof data?.detail==='string'?data.detail:Array.isArray(data?.detail)?readableDetail(data.detail):data?.detail!==undefined?JSON.stringify(data.detail):`HTTP ${r.status} ${r.statusText||''}`.trim());
+  return data;
+ }
+}
 export const rowDefaults=()=>({strike:'152.5',call_bid:'6.52',call_ask:'6.72',call_last:'6.62',put_bid:'1.78',put_ask:'1.98',put_last:'1.88',call_reportedMid:'',put_reportedMid:''});
 export const NEW_MONITOR_STRIKES=5;
 // 与后端 MonitorConfig.nBelow/nAbove 一致：int, ge=0, le=50

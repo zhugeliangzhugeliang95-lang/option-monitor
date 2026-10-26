@@ -6,7 +6,7 @@ from .db import *
 from .models import Config, Snapshot, Leg, utcnow
 from .engine import selected_strikes
 from .providers import provider_for, ProviderError, regular_session, exchange_day, live_expirations, target_expiry
-from .service import save_snapshot, persist_statistics
+from .service import save_snapshot
 from . import retention
 from . import futu_config
 from . import models
@@ -41,8 +41,9 @@ class Worker:
                     else:
                         state=await provider.get_market_state(cfg)
                         if underlying is None: raise ProviderError('MISSING_UNDERLYING')
-                        at=utcnow(); day=exchange_day(cfg,at); expiry=target_expiry(cfg,day)
+                        at=utcnow(); day=exchange_day(cfg,at)
                         expirations=live_expirations(await provider.list_expirations(cfg),day)
+                        expiry=target_expiry(cfg,day,expirations,at)
                         contracts=await provider.list_option_contracts(cfg,expiry) if expiry in expirations else []
                         chosen=selected_strikes(contracts,underlying.last,cfg.nBelow,cfg.nAbove) if underlying.last is not None else []
                         wanted={k for k,_ in chosen}; selected=[c for c in contracts if c.strike in wanted]
@@ -52,7 +53,7 @@ class Worker:
                         simulated=underlying.feedType=='MOCK'
                         market=state.marketOpen and (simulated or regular_session(cfg,at))
                         options=state.optionSessionOpen and all(c.lastTradingAt and at<=c.lastTradingAt for c in selected)
-                        snapshot=Snapshot(monitorId=mid,valuationAt=at,provider=cfg.provider,underlying=underlying,contracts=contracts,
+                        snapshot=Snapshot(selectedExpiration=expiry,monitorId=mid,valuationAt=at,provider=cfg.provider,underlying=underlying,contracts=contracts,
                             legs=[Leg(contract=c,quote=quotes[c.id]) for c in selected if c.id in quotes],marketOpen=market,optionSessionOpen=options,marketReason=state.reason)
                     with Session() as db: result=save_snapshot(db,snapshot,rc.id,extra={'chain':chain_meta} if chain_meta else None)
                     if chain_meta: extra['chain']=chain_meta
@@ -159,7 +160,7 @@ class Worker:
                     await asyncio.gather(*(self.collect(mid,rc,pre_error=error) for mid,rc in items))
         await asyncio.gather(*(group(name,[(m,r) for m,r in due if r.payload['provider']==name]) for name in self.providers if any(r.payload['provider']==name for _,r in due)))
     async def run(self):
-        hb=asyncio.create_task(self.heartbeat()); minute=None; retention_day=None; zone=retention.exchange_zone()
+        hb=asyncio.create_task(self.heartbeat()); retention_day=None; zone=retention.exchange_zone()
         log.info('worker started pid=%s providers=%s',os.getpid(),','.join(self.providers))
         try:
             while True:
@@ -168,10 +169,6 @@ class Worker:
                     # Between collection cycles, once per exchange day at 08:00 America/New_York.
                     retention_day=utcnow().astimezone(zone).date()
                     await self.run_retention()
-                now=utcnow(); key=now.replace(second=0,microsecond=0)
-                if key!=minute:
-                    with Session() as db: persist_statistics(db,now)
-                    minute=key
                 await asyncio.sleep(.25)
         finally:
             await self.stop(hb)

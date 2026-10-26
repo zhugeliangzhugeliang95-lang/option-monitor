@@ -29,8 +29,12 @@ def live_expirations(dates,today):
     """Drop expirations before `today` (exchange date, ISO). today itself is 0DTE and kept."""
     return [d for d in dates if str(d)>=today]
 
-def target_expiry(cfg,today):
-    """sameDay -> today; manual -> the configured date, never substituted (even when expired)."""
+def target_expiry(cfg,today,dates=(),at=None):
+    """Only nearest mode rolls. Manual and sameDay retain their explicit behavior."""
+    if cfg.expiryMode=='nearest':
+        from .expiry import nearest_expiration
+        if at is None: raise ValueError('nearest expiry requires a valuation time')
+        return nearest_expiration(cfg,dates,at)
     return today if cfg.expiryMode=='sameDay' else cfg.expiration
 
 def regular_session(cfg,at):

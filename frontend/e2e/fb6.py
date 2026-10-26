@@ -84,7 +84,7 @@ async def main():
       await pg.close()
     pg,t2,f,nb=await strip(None,None);await pg.close()
     ok('恢复无字段后与基线一致（去掉时间）',f is None and nb==0 and t2.split('\n')[0]==base.split('\n')[0],t2)
-    for tab in('监测配置','历史与追溯'):
+    for tab in('监测配置','人工报价'):
       pg,_,_,_=await strip({'status':'OPEND_OFFLINE'},None)
       bt=pg.get_by_role('button',name=re.compile(tab)).first
       if await bt.count(): await bt.click();await pg.wait_for_timeout(800)

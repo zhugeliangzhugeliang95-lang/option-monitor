@@ -62,7 +62,7 @@ async def main():
     v1=await a.input_value();await pg.wait_for_timeout(3000);await nav('监测总览').click();await pg.wait_for_timeout(600);await nav('人工报价').click();await pg.wait_for_timeout(600)
     v2=await a.input_value();ok('未改→切回为当前时间',v2!=v1 and near(v2),f'{v1}->{v2}')
     await a.fill('2026-10-20T10:00:00-04:00');await pr.fill('2026-10-21T16:00:00-04:00');await ex.fill('2026-10-21')
-    for t in ['历史与追溯','监测总览','人工报价']: await nav(t).click();await pg.wait_for_timeout(600)
+    for t in ['监测配置','监测总览','人工报价']: await nav(t).click();await pg.wait_for_timeout(600)
     vals=(await a.input_value(),await pr.input_value(),await ex.input_value())
     ok('改三项→切 tab 保留',vals==('2026-10-20T10:00:00-04:00','2026-10-21T16:00:00-04:00','2026-10-21'),str(vals))
     await pg.screenshot(path=S+'polish_manual_kept.png',full_page=True)

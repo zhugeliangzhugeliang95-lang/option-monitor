@@ -16,7 +16,7 @@ def migrated(tmp_path_factory):
 
 def fill(path,stamps):
     db=sqlite3.connect(path)
-    for t in retention.PRUNED_TABLES+('frozen_observations','observation_outcomes'):
+    for t in retention.PRUNED_TABLES:
         for i,at in enumerate(stamps):
             if t=='result_outbox': db.execute('INSERT INTO result_outbox(payload,created_at) VALUES(?,?)',('{}',at))
             else:
@@ -62,7 +62,7 @@ def test_cleanup_deletes_old_keeps_today_and_kept_tables(dbpath):
     ev=json.loads(db.execute('SELECT payload FROM result_outbox ORDER BY id DESC').fetchone()[0]); assert ev['type']=='retention' and ev['boundary']=='2026-11-01T04:00:00+00:00'
     # append-only guards restored
     trig={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
-    assert {'immutable_raw_snapshots_delete','immutable_aggregate_results_delete','immutable_frozen_observations_delete'}<=trig
+    assert {'immutable_raw_snapshots_delete','immutable_aggregate_results_delete'}<=trig
     with pytest.raises(sqlite3.IntegrityError,match='append-only'): db.execute('DELETE FROM raw_snapshots')
     # idempotent: second run deletes nothing beyond its own previous event (which is today's)
     s2=retention.cleanup(db,now,1,NY)

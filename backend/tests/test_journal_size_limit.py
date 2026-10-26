@@ -46,7 +46,14 @@ def _big_wal_after_retention(path, limit):
         reader.close(); db.close()
 
 
-def test_wal_truncated_to_limit_after_retention(dbpath, tmp_path):
+def test_wal_truncated_to_limit_after_retention(dbpath, tmp_path, monkeypatch):
+    # Require actual page rewrites for this WAL-growth fixture. SQLite builds with secure_delete
+    # off can free overflow pages without rewriting the 12 MB payload, yielding only a tiny WAL.
+    cleanup = retention.cleanup
+    def rewriting_cleanup(conn, *args, **kwargs):
+        conn.execute('PRAGMA secure_delete=ON')
+        return cleanup(conn, *args, **kwargs)
+    monkeypatch.setattr(retention, 'cleanup', rewriting_cleanup)
     limit = 256 * 1024  # small limit in the test to see the mechanism; production uses 64 MB
     unlimited = tmp_path / 'u.sqlite3'
     sqlite3.connect(dbpath).backup(c := sqlite3.connect(unlimited)); c.close()

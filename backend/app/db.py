@@ -44,15 +44,11 @@ class AggregateResult(Record,Base):
     __tablename__='aggregate_results'
     __table_args__=(Index('ix_aggregate_results_monitor_config_id','monitor_id','config_id','id'),)
     snapshot_id:Mapped[int]=mapped_column(Integer,index=True)
-class MinuteBlock(Record,Base): __tablename__='minute_blocks'
-class StatisticalResult(Record,Base): __tablename__='statistical_results'
 class ProviderStatus(Record,Base): __tablename__='provider_status'
 class WorkerState(Base):
     __tablename__='worker_state'
     id:Mapped[str]=mapped_column(String,primary_key=True)
     payload:Mapped[dict]=mapped_column(JSON)
-class FrozenObservation(Record,Base): __tablename__='frozen_observations'
-class ObservationOutcome(Record,Base): __tablename__='observation_outcomes'
 class ResultOutbox(Base):
     __tablename__='result_outbox'
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)

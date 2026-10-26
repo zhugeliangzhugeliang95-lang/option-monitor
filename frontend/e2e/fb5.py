@@ -57,7 +57,7 @@ async def main():
         if case in('onlyP','both'): await pr.fill(P)
         rv,rp=await act(kind)
         await nav('监测总览').click();await pg.wait_for_timeout(500);await manual();await pg.wait_for_timeout(2500)
-        await nav('历史与追溯').click();await pg.wait_for_timeout(400);await manual()
+        await nav('监测配置').click();await pg.wait_for_timeout(400);await manual()
         va,vp=await a.input_value(),await pr.input_value()
         if case=='onlyA': c=rv==A and va==A and vp!=P and (rp is None or rp!=P)
         elif case=='onlyP': c=near(rv) and (rp is None or rp==P) and vp==P and near(va)

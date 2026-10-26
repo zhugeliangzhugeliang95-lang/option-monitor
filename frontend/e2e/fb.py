@@ -30,7 +30,7 @@ async def main():
     txt=await pg.locator('main').inner_text()
     ok('默认浏览器时区 Asia/Shanghai',zone=='Asia/Shanghai',zone)
     ok('时间带后缀 GMT+8',re.search(r'\d{2}:\d{2}:\d{2} GMT\+8',txt),str(re.findall(r'\d{4}/\S+ \d{2}:\d{2}:\d{2} \S+',txt)[:2]))
-    ok('显著性说明文案',await pg.get_by_test_id('stats-rule').count()==1)
+    ok('统计检验与历史入口已移除',await pg.get_by_test_id('stats-rule').count()==0 and await pg.get_by_role('button',name='历史与追溯',exact=True).count()==0)
     await pg.screenshot(path=S+'overview_shanghai.png',full_page=True)
     await pg.get_by_label('显示时区').select_option('UTC');await pg.reload();await pg.wait_for_timeout(3000)
     z2=await pg.get_by_label('显示时区').input_value();txt=await pg.locator('main').inner_text()
@@ -76,14 +76,12 @@ async def main():
       d0=abs((datetime.datetime.fromisoformat(isos[0].replace('Z','+00:00'))-now).total_seconds()) if isos else 1e9
       ok('人工面板输入时刻为当前',d0<30,f'{isos} diff={d0:.1f}s')
       await pg.screenshot(path=S+'manual_panel.png',full_page=True)
-      # invalid timestamp -> —  : intercept history to return invalid valuationAt
+      # An empty latest response must not reintroduce removed panels or invalid dates.
       await pg.route('**/api/results/latest',lambda r: r.fulfill(status=200,content_type='application/json',body=json.dumps({})))
-      await pg.route('**/api/monitors/*/statistics*',lambda r: r.fulfill(status=200,content_type='application/json',body=json.dumps({'status':'INSUFFICIENT_SAMPLES','n':3,'statsAsOf':'garbage','reason':'采集中断','lastGapAt':'2026-10-26T05:40:00'})))
-      await pg.get_by_role('button',name='SPY').first.click();await pg.get_by_role('button',name='监测总览').first.click();await pg.wait_for_timeout(2500)
+      await pg.get_by_role('button',name='监测总览',exact=True).click();await pg.wait_for_timeout(2500)
       txt=await pg.locator('main').inner_text()
-      ok('非法时间显示—，无 Invalid Date','统计截至 —' in txt and 'Invalid Date' not in txt)
-      ok('可选 reason/lastGapAt 显示且无时区按UTC','原因：采集中断' in txt and '最近一次中断：2026/10/26 13:40:00 GMT+8' in txt)
-      await pg.screenshot(path=S+'stats_optional_fields.png',full_page=True)
+      ok('空行情正常且没有退役统计面板','Invalid Date' not in txt and '统计检验' not in txt)
+      await pg.screenshot(path=S+'empty_latest.png',full_page=True)
     finally:
       created=[m['id'] for m in api('/monitors') if m['id'] not in before]
       for mid in created: api(f'/monitors/{mid}','DELETE')

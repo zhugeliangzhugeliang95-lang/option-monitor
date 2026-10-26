@@ -41,7 +41,7 @@ class Config(Model):
     exchange: str = 'XNYS'
     exchangeTimezone: str = 'America/New_York'
     calendar: str = 'XNYS'
-    expiryMode: Literal['sameDay','manual'] = 'sameDay'
+    expiryMode: Literal['nearest','sameDay','manual'] = 'sameDay'
     expiration: str | None = None
     provider: Literal['manual','mock','http','futu'] = 'manual'
     dataMode: Literal['MANUAL','MOCK','API'] = 'MANUAL'
@@ -55,20 +55,20 @@ class Config(Model):
     collectionEnabled: bool = True
     rate: float = Field(.05, ge=-1, le=2)
     rateLabel: str = '人工假设，非实时利率'
-    timeRule: Literal['timestamp','days365'] = 'timestamp'
+    timeRule: Literal['timestamp','expiryClose','days365'] = 'timestamp'
     remainingDays: float | None = Field(None, ge=0, le=36500)
     pricingAt: datetime | None = None
     timeAssumption: str | None = None
     maxAgeSeconds: float = Field(5, gt=0)
     maxSkewSeconds: float = Field(1, ge=0)
-    statsAlternative: Literal['greater','less','two-sided'] = 'greater'
-    deltaBps: float = 0
-    alpha: float = Field(.05, gt=0, lt=1)
-    minMinutes: int = Field(30, ge=30, le=60)
-    maxMinutes: int = Field(60, ge=30, le=60)
-    minSlots: int = Field(4, ge=4, le=6)
-    family: str = 'primary'
     dividendPV: float | None = Field(None, ge=0)
+    @model_validator(mode='before')
+    @classmethod
+    def discard_retired_statistics(cls,values):
+        # Stored immutable configs keep their original hash/payload. Ignore retired
+        # settings when reading them; new configurations no longer serialize them.
+        retired={'statsAlternative','deltaBps','alpha','minMinutes','maxMinutes','minSlots','family'}
+        return {k:v for k,v in values.items() if k not in retired} if isinstance(values,dict) else values
     @field_validator('exchangeTimezone')
     @classmethod
     def valid_zone(cls,v): ZoneInfo(v); return v
@@ -86,12 +86,13 @@ class Config(Model):
             raise ValueError('富途支持已配置的美股/ETF标的，币种 USD，交易所时区 America/New_York')
         if self.expiryMode=='manual' and not self.expiration: raise ValueError('请选择到期日')
         if self.timeRule=='days365' and self.remainingDays is None: raise ValueError('请输入剩余天数')
-        if self.minMinutes>self.maxMinutes: raise ValueError('统计窗口上限小于下限')
         return self
 class NewConfig(Config):
     """Request body for creating a monitor: trims symbol/underlyingId before the other checks
     (incl. the Futu allow-list). Stored configs are read with plain Config, which does NOT trim,
     so a legacy payload re-validates to the same dict and its config hash is unchanged."""
+    expiryMode: Literal['nearest','sameDay','manual'] = 'nearest'
+    timeRule: Literal['timestamp','expiryClose','days365'] = 'expiryClose'
     @field_validator('symbol','underlyingId',mode='before')
     @classmethod
     def strip_symbol(cls,v): return v.strip() if isinstance(v,str) else v
@@ -142,6 +143,7 @@ class Leg(Model):
     contract: Contract
     quote: Quote
 class Snapshot(Model):
+    selectedExpiration: str | None = None
     monitorId: str
     valuationAt: datetime
     underlying: Quote

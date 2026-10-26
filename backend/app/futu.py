@@ -135,6 +135,7 @@ class FutuProvider:
         self.warm = {}         # key -> WarmState
         self.refresh = {}      # key -> {'failures', 'next'}: one pending SWR refresh per key (c)
         self.dropped = {}      # key -> 'MAX_AGE' until re-warmed (class-1 priority)
+        self.expiry_attempts = {}  # bounded symbol discovery queue fairness
         self.chain_meta = {}   # monitor id -> chain metadata of the last batch (stale / expirationsStale)
         self.windows = {}      # (calendar, tz, day, start) -> warm window or None
         self.window_logged = {}  # window key -> monotonic time of the last calendar-error WARNING
@@ -526,11 +527,27 @@ class FutuProvider:
         self.batch_ok = True  # this NY day had a batch with OpenD reachable (unused-key prune input)
         now = self.mono()
         catalogs, errors, cold, info, meta_keys = {}, {}, {}, {}, {}
+        unresolved, resolved = {}, {}
         for mid, cfg in configs.items():
             try:
                 code = code_for(cfg.underlyingId)
                 day = exchange_day(cfg, wall)
-                expiry = target_expiry(cfg, day)
+                if cfg.expiryMode == 'nearest':
+                    dstate = self._dates_state(code, day, now)
+                    if dstate != 'fresh' or self.dates[code]['fetchedDay'] != day:
+                        unresolved.setdefault(code, cfg)
+                        error = ProviderError('CHAIN_WARMING', 10)
+                        error.operation = 'get_option_expiration_date'
+                        error.chain = {'state': 'warming', 'reason': 'resolvingExpiry'}
+                        errors[mid] = error
+                        continue
+                    expiry = target_expiry(cfg, day, self.dates[code]['dates'], wall)
+                    resolved[mid] = expiry
+                    if expiry is None:
+                        catalogs[mid] = []
+                        continue
+                else:
+                    expiry = target_expiry(cfg, day)
                 key = (code, expiry)
                 self.used.add(key)
                 catalog, meta = self._catalog(code, expiry, day, now, wall)
@@ -594,6 +611,21 @@ class FutuProvider:
                 log.info('futu chain %s %s ready after %ds, %d attempts', key[0], key[1],
                          (wall - st.since).total_seconds(), st.attempts + 1)
         self._prewarm_check(info, cold, warmed, wall)
+        # Expiry discovery is bounded and happens AFTER hot quotes / existing warm work.
+        # Next batch uses the discovered dates; no invented placeholder chain key or 21-call burst.
+        for code, cfg in sorted(unresolved.items(), key=lambda item: self.expiry_attempts.get(item[0], float('-inf')))[:PREFETCH_PER_BATCH]:
+            self.expiry_attempts[code] = self.mono()
+            try:
+                self._dates(code, cfg)
+            except DeadlineReached:
+                break
+            except ProviderError as error:
+                for mid, candidate in configs.items():
+                    if candidate.expiryMode == 'nearest' and code_for(candidate.underlyingId) == code:
+                        errors[mid] = error
+        for mid, snapshot in list(snapshots.items()):
+            if configs[mid].expiryMode == 'nearest':
+                snapshots[mid] = snapshot.model_copy(update={'selectedExpiration': resolved[mid]})
         return snapshots, errors
 
     def _prewarm_check(self, info, cold, warmed, wall):

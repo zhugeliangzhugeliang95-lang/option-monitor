@@ -8,7 +8,7 @@ from app.models import *
 from app.providers import MockProvider
 from app.db import Session,Monitor
 from sqlalchemy import select
-from app.service import create_monitor,save_snapshot,persist_statistics
+from app.service import create_monitor,save_snapshot
 async def main():
     with Session() as db:
         if db.scalar(select(Monitor).limit(1)):
@@ -30,6 +30,5 @@ async def main():
                     p=MockProvider(clock=lambda:tick);u=(await p.get_underlying_snapshots(['SPY']))['SPY'];expiry=(await p.list_expirations(cfg))[0]
                     contracts=await p.list_option_contracts(cfg,expiry);quotes=await p.get_option_quotes(contracts)
                     save_snapshot(db,Snapshot(monitorId=m.id,provider='mock',valuationAt=tick,underlying=u,contracts=contracts,legs=[Leg(contract=c,quote=quotes[c.id]) for c in contracts],marketOpen=True,optionSessionOpen=True,marketReason='MOCK_HISTORICAL_SIMULATION',historical=True))
-            persist_statistics(db,utcnow())
         print('Created explicitly labeled MOCK and MANUAL demo streams. No real quotes.')
 asyncio.run(main())

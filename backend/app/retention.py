@@ -1,7 +1,7 @@
 """Daily retention: keep only the current exchange (US/Eastern) trading day of high-volume result tables.
 
 Runs inside the worker process between collection cycles, once per day at 08:00 exchange time.
-Configuration, research and worker tables are never touched. No backup/export is produced and
+Configuration and worker tables are never touched. No backup/export is produced and
 VACUUM is not run automatically; to reclaim disk space stop the worker/API and run manually:
     sqlite3 data/monitor.sqlite3 'PRAGMA wal_checkpoint(TRUNCATE); VACUUM;'
 """
@@ -11,8 +11,8 @@ from zoneinfo import ZoneInfo
 from .models import Config
 
 log=logging.getLogger('app.retention')
-PRUNED_TABLES=('raw_snapshots','aggregate_results','pair_results','minute_blocks','statistical_results','provider_status','result_outbox')
-KEPT_TABLES=('monitors','run_configs','frozen_observations','observation_outcomes','worker_state')
+PRUNED_TABLES=('raw_snapshots','aggregate_results','pair_results','provider_status','result_outbox')
+KEPT_TABLES=('monitors','run_configs','worker_state')
 BATCH=2000
 RUN_AT=dtime(8,0)
 

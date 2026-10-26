@@ -19,14 +19,6 @@ async page => {
   if(afterPreview.length!==after.length)throw Error('Preview generated a sample');
   await page.reload();
   await page.getByRole('button',{name:/EXCEL MANUAL/}).click();
-  await page.getByRole('button',{name:'锁定当前研究观察'}).click();
-  await page.getByRole('status').filter({hasText:'已锁定'}).waitFor();
-  await page.getByRole('button',{name:'历史与追溯',exact:true}).click();
-  await page.getByRole('heading',{name:'已锁定研究观察'}).waitFor();
-  const frozen=await (await page.request.get(`${base}/api/research/frozen-observations?monitorId=${monitor.id}`)).json();
-  if(!frozen.length)throw Error('Frozen observation not persisted');
-  const csv=await page.request.get(`${base}/api/exports/${monitor.id}?format=csv`);
-  if(!csv.ok()||!(await csv.text()).includes('configHash'))throw Error('CSV failed');
   await page.getByRole('button',{name:'监测总览',exact:true}).click();
   await page.getByRole('button',{name:/SPY MOCK/}).click();
   await page.locator('.price-chart .recharts-line').first().waitFor();
@@ -34,5 +26,5 @@ async page => {
   await page.screenshot({path:'output/playwright/overview-final.png',fullPage:true});
   
   if(errors.length)throw Error(errors.join('\n'));
-  return {manualSave:true,excelResult:result.modes.MID.rawMean,previewDoesNotAddSample:true,persistenceAfterReload:true,frozenCount:frozen.length,csvExport:true,pageErrors:errors};
+  return {manualSave:true,excelResult:result.modes.MID.rawMean,previewDoesNotAddSample:true,persistenceAfterReload:true,pageErrors:errors};
 }

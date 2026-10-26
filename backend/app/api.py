@@ -1,4 +1,4 @@
-import asyncio, csv, io, json
+import asyncio, json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request
@@ -9,7 +9,7 @@ from sqlalchemy import select, func
 from .db import *
 from .models import Config, NewConfig, Snapshot, check_symbol, utcnow
 from .engine import compute, BASES
-from .service import config_for, create_monitor, revise, save_snapshot, statistics_for, summary_columns, summary_row
+from .service import config_for, create_monitor, revise, save_snapshot, summary_columns, summary_row
 from .providers import provider_for, ProviderError
 from .imports import parse_import
 from . import models
@@ -127,8 +127,7 @@ def latest(summary:bool=False):
                 row=db.scalar(select(AggregateResult).where(AggregateResult.monitor_id==m.id).order_by(AggregateResult.id.desc()).limit(1))
                 payload,config_id=(row.payload,row.config_id) if row else (None,None)
             if payload:
-                st=db.scalar(select(StatisticalResult).where(StatisticalResult.monitor_id==m.id,StatisticalResult.config_id==m.config_id).order_by(StatisticalResult.id.desc()).limit(1))
-                out[m.id]={**payload,'oldConfiguration':config_id!=m.config_id,'statistics':st.payload if st else None}
+                out[m.id]={**payload,'oldConfiguration':config_id!=m.config_id}
                 if not summary:
                     # Additive display hint (freshness): from the config that produced this result.
                     rc=db.get(RunConfig,config_id); max_age=(rc.payload if rc else {}).get('maxAgeSeconds',Config.model_fields['maxAgeSeconds'].default)
@@ -148,22 +147,6 @@ def history(mid:str,limit:int=200,before:int|None=None,after:int|None=None,summa
             query=query.order_by(AggregateResult.id.desc()).limit(limit); ordered=lambda rows: list(reversed(rows))
         if summary: return [summary_row(r) for r in ordered(db.execute(query).all())]
         return [{'id':r.id,**r.payload} for r in ordered(db.scalars(query).all())]
-@app.get('/api/snapshots/{sid}')
-def raw_snapshot(sid:int):
-    with Session() as db:
-        raw=db.get(RawSnapshot,sid)
-        if not raw: raise HTTPException(404,'快照不存在')
-        rc=db.get(RunConfig,raw.config_id)
-        return {'snapshot':raw.payload,'config':rc.payload,'configHash':rc.hash,'snapshotId':sid}
-@app.get('/api/monitors/{mid}/statistics')
-def stats(mid:str,mode:str|None=None):
-    if mode and mode not in BASES: raise HTTPException(422,'未知取价口径')
-    with Session() as db:
-        m=monitor(db,mid)
-        if mode:
-            result=statistics_for(db,m,utcnow(),mode); result['historicalRecalculation']=True; result['holmP']=None; return result
-        row=db.scalar(select(StatisticalResult).where(StatisticalResult.monitor_id==mid,StatisticalResult.config_id==m.config_id).order_by(StatisticalResult.id.desc()).limit(1))
-        return row.payload if row else statistics_for(db,m,utcnow())
 @app.get('/api/providers/status')
 def status():
     with Session() as db:
@@ -229,62 +212,3 @@ async def stream(request:Request,lastEventId:str|None=None):
     if last is None: last=parse_event_id(lastEventId)
     queue=asyncio.Queue(maxsize=100); subscribers.add(queue)
     return StreamingResponse(sse_events(queue,last,request.is_disconnected),media_type='text/event-stream',headers={'Cache-Control':'no-cache, no-transform','X-Accel-Buffering':'no'})
-@app.post('/api/research/frozen-observations')
-def freeze(body:dict):
-    with Session() as db:
-        row=db.scalar(select(AggregateResult).where(AggregateResult.snapshot_id==body['snapshotId']))
-        if not row: raise HTTPException(404,'快照不存在')
-        raw=db.get(RawSnapshot,row.snapshot_id); rc=db.get(RunConfig,row.config_id)
-        frozen=record(FrozenObservation,row.monitor_id,row.config_id,{'result':row.payload,'raw':raw.payload,'config':rc.payload,'note':body.get('note',''),'frozenAt':nowstr()})
-        db.add(frozen); db.commit(); return {'id':frozen.id,'status':'FROZEN'}
-@app.post('/api/research/frozen-observations/{fid}/outcomes')
-def outcome(fid:int,body:dict):
-    with Session() as db:
-        f=db.get(FrozenObservation,fid)
-        if not f: raise HTTPException(404,'观察不存在')
-        r=record(ObservationOutcome,f.monitor_id,f.config_id,{'frozenId':fid,'outcome':body}); db.add(r); db.commit(); return {'id':r.id}
-def pair_row(agg):
-    # pair_results is no longer written; derive the same record shape from the aggregate payload.
-    return {'id':agg['id'],'monitor_id':agg['monitor_id'],'config_id':agg['config_id'],'created_at':agg['created_at'],
-            'payload':{k:v['rows'] for k,v in agg['payload']['modes'].items()},'snapshot_id':agg['snapshot_id']}
-EXPORT_TABLES=[RunConfig,RawSnapshot,'pair_results',AggregateResult,MinuteBlock,StatisticalResult,FrozenObservation,ObservationOutcome,ProviderStatus]
-EXPORT_BATCH=500
-def export_rows(db,table,mid,batch=EXPORT_BATCH):
-    # Keyset pagination by primary key keeps memory bounded to one batch.
-    cols=table.__table__.columns; last=None
-    while True:
-        q=select(table).where(table.monitor_id==mid)
-        if last is not None: q=q.where(table.id>last)
-        rows=db.scalars(q.order_by(table.id).limit(batch)).all()
-        if not rows: return
-        for r in rows: yield {c.name:getattr(r,c.name) for c in cols}
-        last=rows[-1].id; db.expunge_all()
-def export_json(mid):
-    with Session() as db:
-        yield '{'
-        for i,t in enumerate(EXPORT_TABLES):
-            name=t if isinstance(t,str) else t.__tablename__
-            rows=(pair_row(r) for r in export_rows(db,AggregateResult,mid)) if t=='pair_results' else export_rows(db,t,mid)
-            yield ('' if i==0 else ', ')+json.dumps(name)+': ['
-            buf=[]
-            for j,r in enumerate(rows):
-                buf.append(('' if j==0 else ', ')+json.dumps(r,ensure_ascii=False))
-                if len(buf)>=EXPORT_BATCH: yield ''.join(buf); buf=[]
-            yield ''.join(buf)+']'
-        yield '}'
-@app.get('/api/exports/{mid}')
-def export(mid:str,format:str='json'):
-    with Session() as db: monitor(db,mid)
-    if format=='csv':
-        with Session() as db:
-            buff=io.StringIO(); writer=csv.writer(buff); writer.writerow(['snapshotId','configHash','valuationAt','feedType','mode','callBasis','putBasis','stockBasis','rawMean','validatedMean','belowMean','aboveMean','validCount','requestedCount','strictEligible'])
-            for r in export_rows(db,AggregateResult,mid):
-                p=r['payload']
-                for mode,a in p['modes'].items(): writer.writerow([p['snapshotId'],p['configHash'],p['valuationAt'],p['feedType'],mode]+[a[k] for k in ('callBasis','putBasis','stockBasis','rawMean','validatedMean','belowMean','aboveMean','validCount','requestedCount','strictEligible')])
-            return Response(buff.getvalue(),media_type='text/csv',headers={'Content-Disposition':f'attachment; filename="{mid}.csv"'})
-    return StreamingResponse((c.encode() for c in export_json(mid)),media_type='application/json',headers={'Content-Disposition':f'attachment; filename="{mid}.json"'})
-
-@app.get('/api/research/frozen-observations')
-def frozen_list(monitorId:str):
-    with Session() as db:
-        return [{'id':r.id,'createdAt':r.created_at,**r.payload} for r in db.scalars(select(FrozenObservation).where(FrozenObservation.monitor_id==monitorId).order_by(FrozenObservation.id.desc()))]

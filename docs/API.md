@@ -9,7 +9,7 @@
 | 方法 / 路径 | 输入或作用 |
 |---|---|
 | GET /api/monitors | 活跃监测对象、完整配置、版本和hash |
-| POST /api/monitors | Config；默认0/0、MID、sameDay、10秒 |
+| POST /api/monitors | NewConfig；直接请求默认0/0、MID、nearest、expiryClose、10秒；界面默认发送5/5 |
 | PATCH /api/monitors/{id} | Config部分字段；验证完整配置后追加新版本；相同值不增版本 |
 | DELETE /api/monitors/{id} | 停用；不删除历史 |
 | POST /api/monitors/{id}/refresh | 与定时采集共用下一10秒槽；不突破限流退避；人工返回输入提示 |
@@ -18,16 +18,9 @@
 | POST /api/imports/quotes | monitorId、format(csv/tsv/json)、content、metadata；标记人工历史 |
 | GET /api/results/latest | 按monitorId返回最后结果；标记旧配置；`?summary=1` 返回精简字段（id、snapshotId、valuationAt、configId、configVersion、feedType、historical、duplicate、status、stockReference、composition、modes{mode:{rawMean,validatedMean,rawGapBps}}） |
 | GET /api/monitors/{id}/history | limit≤500、可选before结果ID；可选after结果ID（返回之后最早的limit条，升序）；`summary=1` 返回同上精简字段；按时序返回 |
-| GET /api/snapshots/{id} | 原始输入、当时配置与hash |
-| GET /api/monitors/{id}/statistics | 最后主要统计；可选mode计算其他口径，标记历史重算且不入主要族 |
 | GET /api/providers/status | worker心跳、各监测最近状态、耗时、延迟、退避 |
 | POST /api/providers/test | provider=manual/mock/http；未配置返回NOT_CONFIGURED |
 | GET /api/stream | SSE；API单广播器读取持久outbox；浏览器重连后重新读取latest/history |
-| POST /api/research/frozen-observations | snapshotId，可选note；不可变观察 |
-| GET /api/research/frozen-observations?monitorId=… | 已锁定观察及完整输入 |
-| POST /api/research/frozen-observations/{id}/outcomes | 后续实际结果/说明追加，绝不更新锁定记录 |
-| GET /api/exports/{monitorId} | 完整JSON审计，包括所有配置、快照、结果、分钟、统计、冻结和追加结果 |
-| GET /api/exports/{monitorId}?format=csv | 每个快照、每个口径各一行，含口径与配置hash |
 
 ### 新鲜度字段 / Freshness fields（只读，纯加法）
 
@@ -36,7 +29,7 @@
 | `GET /api/providers/status` → `cycleSeconds` | 整数 | 总是存在（即使没有 worker 心跳，`worker` 为 `null` 时也返回） | worker 目标采集周期（秒）。与心跳 `worker.targetSeconds` 同一来源（`app/models.py` 的 `CYCLE_SECONDS`，当前 10），不读取心跳；无心跳时即该默认值 |
 | `GET /api/results/latest` → `<monitorId>.staleAfterSeconds` | 整数 | 有结果的监测总是存在；`?summary=1` 响应中不出现 | `ceil(max(maxAgeSeconds, 2 × cycleSeconds))`；`maxAgeSeconds` 取产生该结果的配置版本（旧配置结果用旧配置）。默认 maxAgeSeconds=5 时为 20 |
 
-仅供前端判断「历史 / 过旧快照」的显示阈值；不改变 `maxAgeSeconds` 本身、报价质量判定、config hash/configId 或统计窗口。`/api/monitors/{id}/history`、`/api/snapshots/{id}`、`summary=1` 不变。旧前端可忽略；新前端缺字段时回退 `max(maxAgeSeconds, 20)`。
+仅供前端判断「历史 / 过旧快照」的显示阈值；不改变 `maxAgeSeconds` 本身、报价质量判定、config hash/configId 或统计窗口。`/api/monitors/{id}/history`、`summary=1` 不变。旧前端可忽略；新前端缺字段时回退 `max(maxAgeSeconds, 20)`。
 
 真实运行示例（临时库、MOCK、`python -m app.worker` 实跑；SPY 监测 maxAgeSeconds=5，节选字段）：
 
@@ -49,37 +42,6 @@
 ```
 
 无 worker 心跳时：`{"cycleSeconds": 10, "worker": null, "workerStatus": "INTERRUPTED", ...}`；maxAgeSeconds=30 的监测 `staleAfterSeconds` 为 30。
-
-### 统计诊断字段 / Statistics diagnostic fields
-
-`GET /api/monitors/{id}/statistics`（以及统计SSE/持久化的StatisticalResult）新增以下**只增不改**字段；统计方法与严格资格规则不变。旧版本持久化的结果可能没有这些字段，客户端应视为可选。
-Additive, backward-compatible fields; the statistic and eligibility rules are unchanged. Results persisted before this version may lack them, so treat them as optional.
-
-| 字段 Field | 类型 Type | 含义 Meaning |
-|---|---|---|
-| reason | `{code, message, details?}` | 机器可读原因码 + 中英简短说明；details随code变化 / machine code + short text |
-| lastGapAt | UTC ISO字符串或null | 从asof前一分钟向前，第一个不可用分钟（无数据或槽位不足）；窗口(maxMinutes)全连续时为null；NO_DATA时为null |
-| consecutiveMinutes | int | 截至asof的连续可用分钟数（上限maxMinutes） |
-| neededMinutes | int | 所需连续分钟，即配置`minMinutes`（默认30） |
-| minSlotsPerMinute | int | 每分钟所需10秒槽位数，即配置`minSlots`（默认4） |
-
-`reason.code`：共9个（按优先级判定）/ 9 codes, evaluated in order:
-
-| code | 何时 When | details |
-|---|---|---|
-| OK | status=OK | — |
-| ZERO_SE / NONFINITE | 与status相同 / mirrors status | — |
-| NO_DATA | 当前流没有任何观测 / no observations | — |
-| DATA_STALE | asof前最近一个完整分钟没有任何观测（采集停止）/ no observation in the last closed minute | lastDataAt, minutesSinceLastData |
-| MISSING_EVENT_TIME | 窗口内观测全部不满足严格条件，且行原因中最常见为MISSING_EVENT_TIME | ineligibleRows, topReasons[{reason,count}], statuses[{status,count}] |
-| NOT_STRICT_ELIGIBLE | 窗口内全部不满足严格条件，其他原因（如会话关闭，见statuses）| 同上；最新一行会话关闭时另有`marketOpen:false` / same, plus `marketOpen:false` when the newest row's session is closed |
-| GAP_IN_WINDOW | 缺口之前存在可用分钟，连续分钟不足 / run broken by a gap | n, needed, missingMinutes, underfilledMinutes |
-| TOO_FEW_MINUTES | 采集时间尚短或分钟槽位不足 / not enough minutes yet | n, needed, missingMinutes, underfilledMinutes |
-
-原因计数仅在整个窗口都不合格时用SQLite `json_each`读取已存储的`modes.<mode>.rows[*].reasons`与聚合`status`，不解码完整payload。
-Reason counts are read from stored row reasons and aggregate statuses via SQLite `json_each`, only when the whole window is ineligible.
-
-CSV/TSV列：strike, call_bid, call_ask, call_last, put_bid, put_ask, put_last，以及可选call_reportedMid/put_reportedMid。每个价格可对应`call_bidAt`等事件时间列。缺少时间戳仍可原始计算，但不通过质量。metadata应包含valuationAt、expiration、underlying；可选pricingAt、lastTradingAt、exerciseCutoffAt和人工历史时段声明。导入JSON结构见samples/manual.json。
 
 ## 自定义HTTP行情协议v1
 
@@ -100,11 +62,11 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 
 ## 存储
 
-单一SQLAlchemy ORM管理SQLite。WAL、busy_timeout=15000ms。RunConfig/RawSnapshot/PairResult/AggregateResult/MinuteBlock/StatisticalResult/FrozenObservation/ObservationOutcome有禁止UPDATE/DELETE触发器。Monitor、WorkerState属于可变控制状态，ProviderStatus和Outbox追加。
+单一SQLAlchemy ORM管理SQLite。WAL、busy_timeout=15000ms。RunConfig/RawSnapshot/PairResult/AggregateResult有禁止UPDATE/DELETE触发器。Monitor、WorkerState属于可变控制状态，ProviderStatus和Outbox追加。
 
 所有连接（`db.pragmas` 连接监听器，以及 `retention.run_on_path` 自己的 sqlite3 连接）都设置 `PRAGMA journal_size_limit=67108864`（64 MB）。原因：WAL 文件在 checkpoint 后不会自动缩小，其大小由历史上最大的一次事务决定；实测一次保留清理批次（删除 2000 行）就把 WAL 从约 4.2 MB（默认 1000 页自动 checkpoint）撑到 18.4 MB 并一直保持。设置上限后，每次 checkpoint 完成、WAL 重置时会被截断到上限以内。64 MB 远高于正常约 4 MB 的水位，不影响日常写入，但能防止一次异常大事务后磁盘被长期占用。如需立即回收，仍按 `retention.py` 文档在停机后手动执行 `PRAGMA wal_checkpoint(TRUNCATE)`。
 
-分钟块按统计批次保存不可变修订快照；同一个分钟可出现在多次统计批次中，其statsAsOf可区分，不能将这些审计修订当额外样本。worker在保存结果的同一事务写outbox，API负责广播。worker文件锁与数据库路径绑定，第二个worker启动会拒绝。
+worker在保存结果的同一事务写outbox，API负责广播。worker文件锁与数据库路径绑定，第二个worker启动会拒绝。
 
 ## Futu 用户可见状态（前端契约）
 
@@ -168,7 +130,7 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 - 路径（同一对象，两处）：
   - `GET /api/providers/status` → `monitors.<monitorId>.chain`（`status` 为引擎状态，如 `OK`）；
   - 聚合结果的 `chain` 键：`GET /api/results/latest` → `<monitorId>.chain`；`GET /api/monitors/{mid}/history` → `[].chain`。
-  - `summary=true` 的精简结果**不含** `chain`；原始快照（`/api/snapshots/{sid}`）也不含。
+  - `summary=true` 的精简结果**不含** `chain`；底层原始快照也不含。
 
 | 字段 | 类型 | 是否总有（在此形态内） |
 |---|---|---|
@@ -201,3 +163,11 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 - `chain.reason=offHours`：预热窗口（交易日 `FUTU_PREWARM_START`～收盘后 15 分钟）之外的当天到期冷链。不计入 `CHAIN_UNAVAILABLE` 的等待上限，`waitingSeconds` 保持 0。
 - `chain.droppedReason=MAX_AGE`：缓存链超过最大年龄（当天到期 `FUTU_CHAIN_MAX_AGE` 默认 5400 秒，远期 4 天）被丢弃，按最高优先级重拉。
 - `chain.stale` 等元数据只在 provider_status 和聚合结果的 `chain` 键里，不进入原始快照。
+
+## 历史与追溯功能移除（2026-10-27）
+
+追溯专用的 `/api/snapshots/{id}`、`/api/exports/{monitorId}`、`/api/research/frozen-observations` 及后续结果接口已移除（404）。迁移 0005 删除锁定观察及后续结果专用表；不删除原始行情、配置版本、价格序列或统计数据。`/api/monitors/{id}/history` 继续为监测总览的走势图提供数据。
+
+## 统计检验移除（2026-10-27）
+
+统计接口返回 404；latest 不再附带 statistics，worker 不再生成统计批次。迁移 0006 删除 minute_blocks 和 statistical_results。已有不可变配置保留原始内容和 hash；读取时忽略已退役统计字段，新配置不再包含这些字段。报价及质量字段继续保留。
