@@ -140,6 +140,9 @@ class FutuProvider:
         self.window_logged = {}  # window key -> monotonic time of the last calendar-error WARNING
         self.batching = False  # chain_meta is per batch: only one batch may run at a time
         self.day = None        # last NY day seen by the batch path (b10 sweep)
+        self.used = set()      # (code, expiry) keys referenced by any batch config during self.day
+        self.used_prev = set() # keys used on the previous counted NY day(s), see _roll
+        self.batch_ok = False  # some batch of self.day got past _permissions() (OpenD reachable)
         self.prewarm_checked = set()
         self.offline = False
         self.offline_logged = float('-inf')
@@ -414,19 +417,39 @@ class FutuProvider:
         day = exchange_day(Config(), wall)
         if day == self.day:
             return
+        first = self.day is None
         self.day = day
+        # Unused-key prune: a key survives if any batch config referenced it on either of the last two
+        # NY days (yesterday's + the day before's `used`). Skipped on the first roll after start, and
+        # skipped when yesterday had no batch past _permissions() (e.g. OpenD offline all day): then
+        # yesterday's usage is merged into the kept history instead of being lost.
+        if first:
+            unused = set()
+        elif not self.batch_ok:
+            unused = set(); self.used_prev |= self.used
+        else:
+            keep = self.used_prev | self.used
+            unused = {k for store in (self.chains, self.warm, self.refresh, self.dropped) for k in store if k not in keep}
+            self.used_prev = self.used
+        self.used = set(); self.batch_ok = False
         prev = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
-        gone = {k for k, c in self.chains.items() if k[1] < day or (k[1] == day and c['fetchedDay'] < day)}
+        expired = {k for k, c in self.chains.items() if k[1] < day or (k[1] == day and c['fetchedDay'] < day)}
+        unused_chains = {k for k in unused if k in self.chains and k not in expired}
+        unused_state = 0
+        gone = expired | unused
         for k in gone:
-            del self.chains[k]
+            self.chains.pop(k, None)
         old_dates = [code for code, d in self.dates.items() if d['fetchedDay'] < prev]
         for code in old_dates:
             del self.dates[code]
         for store in (self.warm, self.refresh, self.dropped):
             for k in [k for k in store if k[1] < day or k in gone]:
+                unused_state += k in unused and k[1] >= day
                 del store[k]
-        if gone or old_dates:
-            log.info('futu day roll %s: swept %d chains, %d expiration lists', day, len(gone), len(old_dates))
+        if expired or unused or old_dates:
+            # chains: expired/cross-day + unused counted separately; state = warm/refresh/dropped entries removed as unused
+            log.info('futu day roll %s: swept %d chains (%d expired, %d unused), %d expiration lists; %d unused warm/refresh/dropped entries',
+                     day, len(expired) + len(unused_chains), len(expired), len(unused_chains), len(old_dates), unused_state)
 
     def _dates_state(self, code, day, now):
         """'fresh' (today, within TTL), 'stale' (today past TTL, or yesterday: usable only through
@@ -500,6 +523,7 @@ class FutuProvider:
         wall = self.clock()
         self._roll(wall)
         self._permissions()
+        self.batch_ok = True  # this NY day had a batch with OpenD reachable (unused-key prune input)
         now = self.mono()
         catalogs, errors, cold, info, meta_keys = {}, {}, {}, {}, {}
         for mid, cfg in configs.items():
@@ -508,6 +532,7 @@ class FutuProvider:
                 day = exchange_day(cfg, wall)
                 expiry = target_expiry(cfg, day)
                 key = (code, expiry)
+                self.used.add(key)
                 catalog, meta = self._catalog(code, expiry, day, now, wall)
                 klass = 1 if expiry == day or key in self.dropped else 3
                 info.setdefault(key, (cfg, day, klass))
