@@ -54,7 +54,8 @@ export function chainBadges(c:ChainInfo|null|undefined):string[]{if(!c||typeof c
 /** provider_status 行是否带有 v5 新字段 / 新状态（没有则页面保持现状） */
 export const hasFutuV5Fields=(row:ProviderStatusRow|null|undefined)=>{if(!row||typeof row.status!=='string'||!row.status)return false;const s=row.status;
  // 已知 Futu 状态：新状态，或带了新字段；其他已有状态（OK 等）一律走原逻辑；未知状态只有带 chain 时才走新逻辑
- if(futuStatusTemplates[s])return NEW_FUTU_STATUSES.includes(s)||row.chain!=null||row.pendingSeconds!=null||(s==='TIMEOUT'&&!!row.operation&&row.operation!=='unknown')||(s==='FUTU_BUSY'&&(row.operation==='busy'||row.operation==='maintenance'));
+ // 契约算失败的状态一律走新视图，保证 data-failure=true（红点红字），不依赖是否带 chain/pendingSeconds/operation
+ if(futuStatusTemplates[s])return futuFailure[s]===true||NEW_FUTU_STATUSES.includes(s)||row.chain!=null||row.pendingSeconds!=null||(s==='TIMEOUT'&&!!row.operation&&row.operation!=='unknown')||(s==='FUTU_BUSY'&&(row.operation==='busy'||row.operation==='maintenance'));
  return !statusLabels[s]&&row.chain!=null;};
 export const fmt=(n:any,d=3)=>typeof n==='number'&&Number.isFinite(n)?n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}):'—';
 // 422 pydantic 数组：取每项 msg，去掉 "Value error, " 前缀，拼成可读文字
