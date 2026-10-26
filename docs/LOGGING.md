@@ -11,16 +11,24 @@
 
 ## Masked
 - Labelled values written as `k: v`, `k = v`, `k=v`, `'k': 'v'`, `"k": "v"` or `f(k='v')`. This also works after another label, e.g. `ValueError: password='x'` and `cfg: password='a b'`. Labels are matched **token-aware**: they are split on `_ - .` and camelCase, then whole tokens or joined adjacent tokens are checked.
-  - password, passwd, passphrase, pass, pwd, pw (also `PassWord`, `pass_word`), token, secret, authorization, cookie, credential(s)
+  - password, passwd, passphrase, pass, passcode, pwd, pw, otp, auth (also `PassWord`, `pass_word`), token, secret, authorization, cookie, credential(s)
   - `key` alone, or `key` after api/secret/private/access/auth/client/signing/encryption/session/rsa/dsa/ec/ssh/pem/gpg/pgp/hmac/jwt/master/app/sign (e.g. `api_key`, `apikey`, `apiKey`, `FUTU_RSA_KEY`, `rsa_private_key`)
   - acc/acct/account followed by id/no/num/number at any position, or as the last token (`FUTU_ACC_ID`, `account-id`), plus `user_id` and `session_id`
+- Separator `=>` too (`password => hunter2`). Quoted values honour backslash-escaped quotes (`'hun\'ter2'` is masked whole).
 - Space-separated values after password/passwd/pwd/pw/token/secret (`pwd hunter2`).
 - Bare account numbers (4+ digits) after account/acc/acct (`account 28001234`).
 - `Authorization:` / `Proxy-Authorization:` with any scheme (Bearer, Basic, token, Digest with all its params, NTLM, …): in header style the rest of the line is masked; in a quoted repr, the whole quoted value. Standalone `Bearer/Basic <token>` is masked too.
 - `name=value` in URLs or query strings, even inside quoted reprs, and `scheme://user:pass@` userinfo.
 
+## Performance and long lines
+Redaction runs synchronously inside the worker thread, so it must be linear-time.
+- Label names are bounded to 64 characters (`[A-Za-z_][\w.-]{0,63}`) and cannot start right after `\w`, `.` or `-`, so the scan does not restart after every `.`/`-` of a long token. Unquoted values are matched up to 256 chars; when the label is sensitive the whole rest of the value is masked. URL schemes are bounded to 16 chars and userinfo parts to 256.
+- Any single line longer than **8192** chars (`MAX_LINE`) is truncated before redaction: the head is kept and redacted, and only then is `...[truncated N chars]` appended. The tail is dropped, never printed. A value cut at the boundary (quoted or not) is masked to the end of the head. A line that gets truncated is redacted on its own, so a label at the end of one line won't mask a value on the next line in that case.
+- Tests: 100,000-char lines of `a.`, `a-`, `a:`, `a=`, `x://`, `=`, `:`, `/`, `@`, quotes, spaces and others each finish in under 50 ms (best of 3). The redaction also scales linearly with truncation disabled. Measured worst case is about 19 ms (`a:`).
+- Not masked because of the bounds: label names longer than 64 chars (e.g. a 70-char dotted path ending in `password`).
+
 ## Not masked on purpose
-These are tested: `passport`, `compass`, `bypass`, `monkey`, `keys`, `keyboard`, `account_balance`, `optionSessionOpen`, `symbol=…`, `status=…`. A token like `pass` is only matched when it's a whole token.
+These are tested: `passport`, `compass`, `bypass`, `monkey`, `keys`, `keyboard`, `account_balance`, `optionSessionOpen`, `authority`, `symbol=…`, `status=…`. A token like `pass` is only matched when it's a whole token.
 
 ## Known unmasked cases (not covered)
 - URL-encoded secrets: `password%3Dhunter2` and `%27`-quoted values aren't decoded.

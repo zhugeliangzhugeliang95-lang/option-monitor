@@ -156,3 +156,48 @@ def test_configure_twice_no_double_logging():
         assert stream.getvalue().count('once')==1 and 'hunter2' not in stream.getvalue()
         app=logging.getLogger('app'); n=sum(getattr(x,'_app_handler',False) for x in app.handlers); assert n==1
     finally: root.removeHandler(h)
+
+
+# --- round 3: linear-time redaction, truncation, extra key names, => and escaped quotes ---
+import time
+from app import logs as _logs
+
+PATHOLOGICAL=['a.','a-','a=','a:','=',':','/','@','"',"'",' ','a ','a=b ','a:b ','x://','a:/','a@','"a":',"a:'",
+              'a.b=','password:','password=','acc1','bearer ','authorization: ','\\\'','A','a_']
+
+@pytest.mark.parametrize('unit',PATHOLOGICAL)
+def test_redact_long_line_is_fast(unit):
+    line=(unit*(100_000//len(unit)+1))[:100_000]
+    best=min(_timed(line) for _ in range(3))
+    assert best<0.05, f'{unit!r}: {best:.3f}s'
+
+def _timed(line):
+    t=time.perf_counter(); redact(line); return time.perf_counter()-t
+
+@pytest.mark.parametrize('unit',['a.','a-','a:','a=','x://','a:/'])
+def test_redaction_scales_linearly_without_truncation(unit,monkeypatch):
+    monkeypatch.setattr(_logs,"MAX_LINE",10**9)
+    small=min(_timed((unit*20_000)[:20_000]) for _ in range(3)); big=min(_timed((unit*80_000)[:80_000]) for _ in range(3))
+    assert big<max(small,0.002)*10   # 4x input: linear ~4x, quadratic ~16x
+
+def test_truncation_marker_and_cut_secret_masked():
+    for tail in (" password='hunter2secret' tail",' password=hunter2secret',' password="hunter2secret"'):
+        out=redact('x'*(_logs.MAX_LINE-12)+tail)
+        assert 'hunt' not in out and 'secret' not in out and out.endswith(' chars]'), out[-60:]
+        assert '[truncated ' in out and '***' in out
+    assert redact('ok '*10)=='ok '*10
+
+def test_truncation_is_per_line_and_short_lines_kept():
+    out=redact('a'*20000+'\npassword=hunter2\nshort')
+    assert out.endswith('\npassword=***\nshort') and '[truncated 11808 chars]' in out
+
+@pytest.mark.parametrize('text,secret',[('auth: hunter2','hunter2'),('passcode=4321','4321'),('otp=987654','987654'),
+    ('password => hunter2','hunter2'),('password=>hunter2','hunter2'),(r"password: 'hun\'ter2'",'ter2'),
+    (r'password: "hun\"ter2"','ter2'),('password: '+'s'*1000,'s'*300),("cfg: password='a b'",'a b')])
+def test_round3_masked(text,secret):
+    assert secret not in redact(text)
+
+def test_round3_visible():
+    s='monkey=banana keys=SPY keyboard=1 passport=1 compass=1 bypass=1 optionSessionOpen=False authority=x'
+    assert redact(s)==s
+    assert redact(r"password: 'hun\'ter2' next=1")==r"password: '***' next=1"

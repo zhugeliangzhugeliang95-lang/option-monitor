@@ -17,7 +17,7 @@ MASK='***'
 # Sensitive words are matched against whole tokens or concatenations of adjacent tokens, so
 # PassWord / pass_word -> "password", FUTU_ACC_ID -> "acc"+"id", but passport/compass/bypass,
 # monkey, keys, keyboard are single tokens that are not in the lists and stay visible.
-_ALWAYS={'password','passwd','passphrase','pass','pwd','pw','token','secret','authorization','cookie',
+_ALWAYS={'password','passwd','passphrase','pass','passcode','pwd','pw','otp','auth','token','secret','authorization','cookie',
         'apikey','credential','credentials','privatekey','secretkey','accesskey'}
 _ACCOUNT={'account','acc','acct'}
 _ACCOUNT_SUFFIX={'id','no','num','number'}
@@ -45,18 +45,25 @@ def sensitive_name(name):
     return any(w in ('accountid','accid','acctid','userid','accno') for _,_,w in _spans(t))
 
 # Unquoted values never contain '=' so 'ValueError: password=...' cannot swallow the next key.
-_VALUE=r"""(?:'[^']*'|"[^"]*"|[^\s,;&)}\]'"=]+)"""
+# Quoted values honour backslash escapes ('hun\\'ter2') and run to end of text when unterminated
+# (e.g. cut by truncation), so no tail of a quoted secret is left visible.
+_VALUE=r"""(?:'(?:[^'\\]|\\.)*(?:'|\\?\Z)|"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[^\s,;&)}\]'"=]{1,256})"""
+_VALUE_RUN=re.compile(r"""[^\s,;&)}\]'"=]*""")   # rest of an unquoted value longer than the 256 bound
+# Names are bounded and may not start right after another name character (incl. '.'), so the
+# scan is linear: no restart after every '.' or '-' of a long token (was quadratic on long lines).
+_NAME=r'(?<![\w.-])[A-Za-z_][\w.-]{0,63}(?![\w.-])'
+MAX_LINE=8192    # longer lines are truncated (tail dropped) BEFORE redaction
 _AUTH_SCHEME=r"(?:(bearer|basic|token|digest|negotiate|ntlm|hmac[\w-]*)\s+)?"
 # quoted repr ('Authorization': 'Digest ...'): mask up to the closing quote
 _AUTH_Q=re.compile(r"""(?i)(['"](?:proxy-)?authorization['"]\s*[:=]\s*(['"]))"""+_AUTH_SCHEME+r"""(?:(?!\2).)+""")
 # header style (Authorization: Digest username="x", response="y"): mask the rest of the line
 _AUTH=re.compile(r"""(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)"""+_AUTH_SCHEME+r"""[^\r\n]+""")
-_KV=re.compile(r"""(?<![\w-])(['"]?)([A-Za-z_][\w.-]*)\1(\s*[:=]\s*)("""+_VALUE+')')
-_EQ=re.compile(r"""(?<![\w-])([A-Za-z_][\w.-]*)=([^&\s,;)'"}\]]+)""")  # also inside quoted strings (URLs)
+_KV=re.compile(r"""(?<![\w.-])(['"]?)((?<![\w.-])[A-Za-z_][\w.-]{0,63}(?![\w.-]))\1(\s*(?:=>|[:=])\s*)("""+_VALUE+')')
+_EQ=re.compile(r"""("""+_NAME+r""")=([^&\s,;)'"}\]]+)""")  # also inside quoted strings (URLs)
 _SPACED=re.compile(r"""(?i)\b(password|passwd|pwd|pw|token|secret)(\s+)(?!=|:)([^\s,;'"]+)""")
 _ACCOUNT_NUM=re.compile(r"""(?i)\b(acc(?:ount)?|acct)((?:[_-]?(?:id|no|number))?['"]?[\s:=#'"]*)(\d{4,})""")
 _SCHEME_TOKEN=re.compile(r'(?i)\b(bearer|basic)\s+(?!\*\*\*)[A-Za-z0-9._~+/=-]{6,}')
-_URL_CREDS=re.compile(r'(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@')
+_URL_CREDS=re.compile(r'(?i)(\b[a-z][a-z0-9+.-]{0,15}://)[^/\s:@]{1,256}:[^/\s@]{1,256}@')
 
 def _kv_scan(text):
     """Mask sensitive `name<sep>value`. If the name is not sensitive, only the name is consumed and
@@ -68,12 +75,22 @@ def _kv_scan(text):
         q,name,sep,val=m.groups()
         if sensitive_name(name) and not val.strip('\'"').startswith(MASK):
             masked=f'{val[0]}{MASK}{val[0]}' if val[:1] in '\'"' else MASK
-            out.append(text[pos:m.start()]+f'{q}{name}{q}{sep}{masked}'); pos=m.end()
+            end=m.end() if val[:1] in '\'"' else _VALUE_RUN.match(text,m.end()).end()
+            out.append(text[pos:m.start()]+f'{q}{name}{q}{sep}{masked}'); pos=end
         else:
             out.append(text[pos:m.end(2)]); pos=m.end(2)
 
 def redact(text):
+    """Mask secrets. Over-long lines (rare): each line is handled on its own, the head of a long
+    line is kept, redacted, and only then followed by a visible '...[truncated N chars]' marker, so
+    a value cut at the boundary (quoted or not) is masked to the end of the kept head."""
     text=str(text)
+    if len(text)>MAX_LINE and any(len(l)>MAX_LINE for l in text.split('\n')):
+        return '\n'.join(_redact(l) if len(l)<=MAX_LINE else _redact(l[:MAX_LINE])+f'...[truncated {len(l)-MAX_LINE} chars]'
+                         for l in text.split('\n'))
+    return _redact(text)
+
+def _redact(text):
     text=_AUTH_Q.sub(lambda m: m.group(1)+(m.group(3)+' ' if m.group(3) else '')+MASK,text)
     text=_AUTH.sub(lambda m: m.group(0) if m.group(0).rstrip().endswith(MASK+"'") or m.group(0).rstrip().endswith(MASK+'"') else m.group(1)+(m.group(2)+' ' if m.group(2) else '')+MASK,text)
     text=_URL_CREDS.sub(r'\1***:***@',text)
