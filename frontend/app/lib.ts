@@ -1,6 +1,14 @@
 export type Obj=Record<string,any>;
 // 统计接口：reason / lastGapAt 为后端可选字段，前端不依赖其存在
-export type Statistics=Obj&{reason?:string|null;lastGapAt?:string|null};
+export type StatsReason=string|{code:string;message?:string;details?:unknown}|null;
+export type Statistics=Obj&{reason?:StatsReason;lastGapAt?:string|null;consecutiveMinutes?:number;neededMinutes?:number;minSlotsPerMinute?:number};
+// 统计 reason.code → 界面文案（以 code 为准；后端 message 仅作未知 code 兜底；details 不显示）。对照 backend/app/statistics.py REASON_TEXT 与 docs/API.md
+export const reasonLabels:Record<string,string>={NO_DATA:'暂无数据：当前数据流还没有采集到观测',DATA_STALE:'数据已停止更新：最近一个完整分钟没有观测（采集可能已中断）',GAP_IN_WINDOW:'窗口内有缺口：连续分钟被中断，需重新累计',TOO_FEW_MINUTES:'连续分钟不足：采集时间尚短或部分分钟槽位不足',MISSING_EVENT_TIME:'行情缺少事件时间，不满足严格条件',NOT_STRICT_ELIGIBLE:'观测不满足严格条件（如休市 / 会话关闭）',ZERO_SE:'标准误为零，无法检验',NONFINITE:'数据中存在非有限值'};
+// 兼容字符串与对象；code=OK 不视为问题（返回空）
+export const reasonText=(r:unknown):string=>{if(r==null||r==='')return '';if(typeof r==='string')return r==='OK'?'':reasonLabels[r]||r;if(typeof r==='object'){const o=r as {code?:unknown;message?:unknown};const code=typeof o.code==='string'?o.code:'';if(code==='OK')return '';if(code&&reasonLabels[code])return reasonLabels[code];if(typeof o.message==='string'&&o.message)return o.message;return code;}return '';};
+const isNum=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v);
+export const numOr=(v:unknown,d:number)=>isNum(v)?v:d;
+export {isNum};
 export const focusSymbols=['TSLA','NVDA','META','AMZN','GOOGL','AAPL','MSFT'];
 export const focusRank=(m:Obj)=>{const rank=focusSymbols.indexOf(m.config.symbol);return rank<0?focusSymbols.length:rank;};
 export const bases=['BID','ASK','MID','LAST','CUSTOM'];
@@ -13,7 +21,7 @@ export const SYMBOL_RE=/^[A-Z0-9.\-]+$/;
 export const ZONE_KEY='option-monitor.zone';
 export const browserZone=()=>{try{return Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';}catch{return 'UTC';}};
 // 空/非法 → —；纯日期原样；无时区的时间戳按 UTC 解析；附带时区缩写（取不到则用 IANA 名）
-export function formatTime(v:any,zone:string){if(v==null||v==='')return '—';if(typeof v==='string'){const s=v.trim();if(/^\d{4}-\d{2}-\d{2}$/.test(s))return s;v=/T\d{2}:\d{2}/.test(s)&&!/(Z|[+-]\d{2}:?\d{2})$/i.test(s)?s+'Z':s;}const d=new Date(v);if(Number.isNaN(d.getTime()))return '—';try{const text=d.toLocaleString('zh-CN',{timeZone:zone,hour12:false});const abbr=new Intl.DateTimeFormat('en-US',{timeZone:zone,timeZoneName:'short'}).formatToParts(d).find(p=>p.type==='timeZoneName')?.value;return `${text} ${abbr||zone}`;}catch{return '—';}}
+export function formatTime(v:any,zone:string){if(v==null||v==='')return '—';if(typeof v==='string'){const s=v.trim();if(/^\d{4}-\d{2}-\d{2}$/.test(s))return s;const h=s.match(/^(.*T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)([+-]\d{2})$/);v=h?`${h[1]}${h[2]}:00`:/T\d{2}:\d{2}/.test(s)&&!/(Z|[+-]\d{2}:?\d{2})$/i.test(s)?s+'Z':s;}const d=new Date(v);if(Number.isNaN(d.getTime()))return '—';try{const text=d.toLocaleString('zh-CN',{timeZone:zone,hour12:false});const abbr=new Intl.DateTimeFormat('en-US',{timeZone:zone,timeZoneName:'short'}).formatToParts(d).find(p=>p.type==='timeZoneName')?.value;return `${text} ${abbr||zone}`;}catch{return '—';}}
 export async function api(path:string,body?:unknown,method?:string){const r=await fetch('/api'+path,{method:method||(body?'POST':'GET'),headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const text=await r.text();let data:any;try{data=text?JSON.parse(text):null;}catch{throw new Error(`HTTP ${r.status} ${r.statusText||''}`.trim());}if(!r.ok)throw new Error(typeof data?.detail==='string'?data.detail:Array.isArray(data?.detail)?readableDetail(data.detail):data?.detail!==undefined?JSON.stringify(data.detail):`HTTP ${r.status} ${r.statusText||''}`.trim());return data;}
 export const rowDefaults=()=>({strike:'152.5',call_bid:'6.52',call_ask:'6.72',call_last:'6.62',put_bid:'1.78',put_ask:'1.98',put_last:'1.88',call_reportedMid:'',put_reportedMid:''});
 export const NEW_MONITOR_STRIKES=5;
