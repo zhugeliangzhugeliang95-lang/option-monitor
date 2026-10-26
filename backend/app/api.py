@@ -7,9 +7,9 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import ValidationError
 from sqlalchemy import select, func
 from .db import *
-from .models import Config, Snapshot, utcnow
+from .models import Config, Snapshot, check_symbol, utcnow
 from .engine import compute, BASES
-from .service import create_monitor, revise, save_snapshot, statistics_for, summary_columns, summary_row
+from .service import config_for, create_monitor, revise, save_snapshot, statistics_for, summary_columns, summary_row
 from .providers import provider_for, ProviderError
 from .imports import parse_import
 
@@ -66,11 +66,16 @@ def monitors():
     with Session() as db: return [monitor_dict(db,m) for m in db.scalars(select(Monitor).where(Monitor.active==True))]
 @app.post('/api/monitors')
 def add_monitor(cfg:Config):
+    for f in ('symbol','underlyingId'): check_symbol(getattr(cfg,f),f)
     with Session() as db: return monitor_dict(db,create_monitor(db,cfg))
 @app.patch('/api/monitors/{mid}')
 def update_monitor(mid:str,patch:dict):
     with Session() as db:
-        m=monitor(db,mid); revise(db,m,patch); return monitor_dict(db,m)
+        m=monitor(db,mid); old=config_for(db,m).payload
+        # Only a symbol that is being changed is format-checked; legacy stored symbols stay readable/updatable.
+        for f in ('symbol','underlyingId'):
+            if f in patch and (patch[f].strip() if isinstance(patch[f],str) else patch[f])!=old.get(f): check_symbol(patch[f],f)
+        revise(db,m,patch); return monitor_dict(db,m)
 @app.delete('/api/monitors/{mid}')
 def delete_monitor(mid:str):
     with Session() as db:
