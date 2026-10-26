@@ -140,6 +140,7 @@ class FutuProvider:
         self.window_logged = {}  # window key -> monotonic time of the last calendar-error WARNING
         self.batching = False  # chain_meta is per batch: only one batch may run at a time
         self.day = None        # last NY day seen by the batch path (b10 sweep)
+        self.used = set()      # (code, expiry) keys referenced by any batch config during self.day
         self.prewarm_checked = set()
         self.offline = False
         self.offline_logged = float('-inf')
@@ -414,11 +415,17 @@ class FutuProvider:
         day = exchange_day(Config(), wall)
         if day == self.day:
             return
+        first = self.day is None
         self.day = day
+        # Keys no config referenced during the previous NY day (deleted/changed monitors, e.g. far-dated
+        # expiries) are dropped; skipped on the first batch after start, when there is no full day of usage.
+        unused = set() if first else {k for store in (self.chains, self.warm, self.refresh, self.dropped)
+                                      for k in store if k not in self.used}
+        self.used = set()
         prev = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
-        gone = {k for k, c in self.chains.items() if k[1] < day or (k[1] == day and c['fetchedDay'] < day)}
+        gone = {k for k, c in self.chains.items() if k[1] < day or (k[1] == day and c['fetchedDay'] < day)} | unused
         for k in gone:
-            del self.chains[k]
+            self.chains.pop(k, None)
         old_dates = [code for code, d in self.dates.items() if d['fetchedDay'] < prev]
         for code in old_dates:
             del self.dates[code]
@@ -426,7 +433,7 @@ class FutuProvider:
             for k in [k for k in store if k[1] < day or k in gone]:
                 del store[k]
         if gone or old_dates:
-            log.info('futu day roll %s: swept %d chains, %d expiration lists', day, len(gone), len(old_dates))
+            log.info('futu day roll %s: swept %d chains (%d unused), %d expiration lists', day, len(gone), len(unused), len(old_dates))
 
     def _dates_state(self, code, day, now):
         """'fresh' (today, within TTL), 'stale' (today past TTL, or yesterday: usable only through
@@ -508,6 +515,7 @@ class FutuProvider:
                 day = exchange_day(cfg, wall)
                 expiry = target_expiry(cfg, day)
                 key = (code, expiry)
+                self.used.add(key)
                 catalog, meta = self._catalog(code, expiry, day, now, wall)
                 klass = 1 if expiry == day or key in self.dropped else 3
                 info.setdefault(key, (cfg, day, klass))
