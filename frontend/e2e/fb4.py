@@ -1,5 +1,10 @@
 import os,pathlib
-BASE=os.environ.get('E2E_BASE_URL','http://localhost:3200')
+BASE=os.environ.get('E2E_BASE_URL','').rstrip('/')
+if not BASE:
+  import sys
+  sys.stderr.write('用法：E2E_BASE_URL=http://localhost:<前端端口> [E2E_ALLOW_WRITE=1] python frontend/e2e/%s\n'
+    'E2E_BASE_URL 必填（无默认值，避免误打到别人的栈）；只应指向自己用临时 DATABASE_PATH 起的测试栈。\n' % __import__('os').path.basename(__file__))
+  sys.exit(2)
 HERE=pathlib.Path(__file__).resolve().parent
 SHOTS=HERE/'shots';SHOTS.mkdir(exist_ok=True)
 import asyncio,json,re,datetime
@@ -10,19 +15,32 @@ def near(v): return abs((datetime.datetime.fromisoformat(v.replace('Z','+00:00')
 async def main():
   async with async_playwright() as p:
     b=await p.chromium.launch();ctx=await b.new_context(timezone_id='Asia/Shanghai',viewport={'width':1400,'height':1000});pg=await ctx.new_page()
-    errs=[];pg.on('console',lambda m: m.type=='error' and errs.append(m.text))
+    # Chromium 对任何非 2xx（含 4xx 与 route.abort）都会打一条 "Failed to load resource"；按消息来源 URL 区分本脚本拦截的 POST，其余 error 必须为 0
+    errs=[];icpt=[]
+    def onc(m):
+      if m.type!='error': return
+      u=(m.location or {}).get('url','')
+      (icpt if 'Failed to load resource' in m.text and re.search(r'/api/(monitors|manual-snapshots)$',u) and '422' in m.text else errs).append(m.text)
+    pg.on('console',onc)
     posted=[];snaps=[]
     async def h(route):
       r=route.request
-      if r.method=='POST': posted.append(json.loads(r.post_data or '{}'));await route.fulfill(status=500,content_type='application/json',body='{"detail":"intercepted"}')
+      if r.method=='POST': posted.append(json.loads(r.post_data or '{}'));await route.fulfill(status=422,content_type='application/json',body='{"detail":"intercepted"}')
       else: await route.continue_()
     await pg.route(re.compile(r'/api/monitors$'),h)
-    async def hs(route): snaps.append(json.loads(route.request.post_data));await route.fulfill(status=500,content_type='application/json',body='{"detail":"intercepted"}')
+    async def hs(route): snaps.append(json.loads(route.request.post_data));await route.fulfill(status=422,content_type='application/json',body='{"detail":"intercepted"}')
     await pg.route(re.compile(r'/api/manual-snapshots$'),hs)
     await pg.goto(BASE);await pg.wait_for_timeout(3500)
     s=pg.get_by_role('textbox',name='标的代码');err=pg.get_by_test_id('create-error')
+    addb=pg.get_by_role('button',name='新增标的');await addb.wait_for(state='visible',timeout=15000)
+    first=[True]
     async def tryc(v):
-      await pg.get_by_role('button',name='新增标的').click();await pg.wait_for_timeout(200)
+      if first[0]:
+        first[0]=False
+        try: await addb.click(timeout=5000)
+        except Exception as e: print('首次点击「新增标的」失败，重试一次:',type(e).__name__);await pg.wait_for_timeout(1000);await addb.click(timeout=10000)
+      else: await addb.click()
+      await pg.wait_for_timeout(200)
       n=len(posted);await s.fill(v);await pg.get_by_role('button',name='创建监测').click();await pg.wait_for_timeout(500)
       e=await err.inner_text() if await err.count() else ''
       inmodal=await pg.locator('[role=dialog], .modal').filter(has=err).count()>0 if e else False
@@ -57,7 +75,9 @@ async def main():
     await pg.wait_for_timeout(300);await nav('人工报价').click();await pg.wait_for_timeout(400)
     await a.fill('2026-10-20T10:00:00-04:00');await pg.get_by_role('button',name='计算并保存快照').click();await pg.wait_for_timeout(800)
     ok('保存时已改时间保留',len(snaps)==2 and snaps[1]['valuationAt']=='2026-10-20T10:00:00-04:00',snaps[-1]['valuationAt'])
-    ok('控制台无业务 error',not [e for e in errs if 'intercepted' not in e and '500' not in e],str(errs[:3]))
+    print('console errors',len(errs),'intercepted-422 network lines',len(icpt),'intercepted requests',len(posted)+len(snaps))
+    ok('控制台无 500、非拦截 error 数为 0',len(errs)==0 and not any('500' in e for e in icpt),str(errs[:3]))
+    ok('拦截产生的网络行数 = 拦截请求数',len(icpt)==len(posted)+len(snaps),f'{len(icpt)}/{len(posted)+len(snaps)}')
     await b.close()
   print('SUMMARY',sum(R),'/',len(R))
 asyncio.run(main())

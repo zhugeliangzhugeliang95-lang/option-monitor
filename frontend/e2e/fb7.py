@@ -1,7 +1,12 @@
-# 运行：先起 dev 栈（scripts/dev.sh，前端默认 3200，可用 E2E_BASE_URL 覆盖），python frontend/e2e/fb7.py；只 mock 读接口，不写 data/
+# 运行：先起 dev 栈（scripts/dev.sh，须设置 E2E_BASE_URL），python frontend/e2e/fb7.py；只 mock 读接口，不写 data/
 # stale-threshold：quality-strip 「历史 / 过旧快照」阈值（固定页面时钟，SSE 置空，mock results/latest 与 providers/status）
 import asyncio,json,re,time,os,datetime as dt
-BASE=os.environ.get('E2E_BASE_URL','http://localhost:3200')
+BASE=os.environ.get('E2E_BASE_URL','').rstrip('/')
+if not BASE:
+  import sys
+  sys.stderr.write('用法：E2E_BASE_URL=http://localhost:<前端端口> [E2E_ALLOW_WRITE=1] python frontend/e2e/%s\n'
+    'E2E_BASE_URL 必填（无默认值，避免误打到别人的栈）；只应指向自己用临时 DATABASE_PATH 起的测试栈。\n' % __import__('os').path.basename(__file__))
+  sys.exit(2)
 from playwright.async_api import async_playwright
 import urllib.request
 R=[]
