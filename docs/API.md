@@ -75,6 +75,65 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 | （正常出数，链为缓存） | provider_status 和聚合结果 | 非失败 | `chain`={`stale`, `ageSeconds`, `fetchedAt`, `refreshFailures`, `expirationsStale`}；链和到期日都新鲜时**不出现** | `CHAIN_STALE` | 使用 {ageSeconds} 秒前的期权链（后台刷新中）；`expirationsStale`：到期日列表为前一交易日 |
 | `CHAIN_UNAVAILABLE` | provider_status | 失败，固定 10 秒重试，不退避，不累计失败次数；按标的的拉链退避最长 300 秒 | 同 `CHAIN_WARMING`，`chain.state`=`unavailable` | `CHAIN_UNAVAILABLE` | 期权链长时间无法获取（错误码 {code}），请检查权限或 OpenD |
 
+### JSON 路径与类型
+
+（按 #18 代码核对；示例 JSON 来自 fake OpenD 的真实运行输出，时间均为 UTC ISO 8601 字符串，带 `+00:00`。）
+
+`chain` 有**两种互斥形态**，按 `status` 区分（也可看是否有 `chain.state`）：
+
+**A. 预热/不可用形态**：只在 `status` 为 `CHAIN_WARMING` 或 `CHAIN_UNAVAILABLE` 时出现，只在 provider_status。
+
+- 路径：`GET /api/providers/status` → `monitors.<monitorId>.chain`（`monitors` 是以监测 id 为键的对象，不是数组）。
+- 聚合结果里**没有**这一形态（此时没有出数）。
+
+| 字段 | 类型 | 是否总有 |
+|---|---|---|
+| `chain.state` | string：`warming` / `unavailable` | 总有 |
+| `chain.reason` | string：`queued` / `retrying` / `offHours` | 总有 |
+| `chain.waitingSeconds` | int（秒；`offHours` 时恒为 0） | 总有 |
+| `chain.attempts` | int | 总有 |
+| `chain.lastError` | object 或 `null`：{`code`: string, `at`: ISO string, `ret`?: int} | 总有（可为 null；`ret` 可选） |
+| `chain.droppedReason` | string：目前只有 `MAX_AGE` | 可选，仅缓存因超龄被丢弃后出现 |
+
+**`offHours` 是 `chain.reason` 的一个取值**，属于 `CHAIN_WARMING` 状态的一个变体（前端文案 key `CHAIN_WARMING_OFF_HOURS`）。它**不是布尔字段，也不是独立的状态码**；`status` 仍是 `CHAIN_WARMING`。
+
+```json
+{"status": "CHAIN_WARMING", "operation": "get_option_chain", "retryAfter": 10, "...": "...",
+ "chain": {"state": "warming", "reason": "offHours", "waitingSeconds": 0, "attempts": 0, "lastError": null}}
+```
+```json
+"chain": {"state": "warming", "reason": "retrying", "waitingSeconds": 31, "attempts": 2,
+          "lastError": {"code": "FUTU_REQUEST_FAILED", "at": "2026-10-23T15:00:31+00:00", "ret": -1}}
+```
+```json
+"chain": {"state": "warming", "reason": "retrying", "waitingSeconds": 0, "attempts": 1,
+          "lastError": {"code": "FUTU_REQUEST_FAILED", "at": "2026-10-23T16:32:00+00:00", "ret": -1},
+          "droppedReason": "MAX_AGE"}
+```
+
+**B. 缓存元数据形态**：正常出数（有快照）但链过了新鲜期，或到期日列表来自前一交易日时出现；链和到期日都新鲜时整个 `chain` 键**不存在**。
+
+- 路径（同一对象，两处）：
+  - `GET /api/providers/status` → `monitors.<monitorId>.chain`（`status` 为引擎状态，如 `OK`）；
+  - 聚合结果的 `chain` 键：`GET /api/results/latest` → `<monitorId>.chain`；`GET /api/monitors/{mid}/history` → `[].chain`。
+  - `summary=true` 的精简结果**不含** `chain`；原始快照（`/api/snapshots/{sid}`）也不含。
+
+| 字段 | 类型 | 是否总有（在此形态内） |
+|---|---|---|
+| `chain.stale` | bool（链已过新鲜 TTL、按 SWR 出数时为 true） | 总有 |
+| `chain.ageSeconds` | int（距 `fetchedAt` 的秒数） | 总有 |
+| `chain.fetchedAt` | ISO 8601 string（UTC） | 总有 |
+| `chain.refreshFailures` | int（后台刷新连续失败次数） | 总有 |
+| `chain.expirationsStale` | bool（到期日列表为前一交易日） | 总有 |
+
+注意：可能出现 `stale=false` 且 `expirationsStale=true`（链新鲜、到期日列表旧）。
+
+```json
+{"status": "OK", "operation": null, "retryAfter": 0, "...": "...",
+ "chain": {"stale": true, "ageSeconds": 1853, "fetchedAt": "2026-10-23T15:00:00+00:00",
+           "refreshFailures": 0, "expirationsStale": false}}
+```
+
 **前端规则：**
 
 - 按 `status` 选文案。
