@@ -7,7 +7,7 @@ Redaction is a last line of defence applied to the *final formatted line* of eac
 Covered loggers: root, 'app' tree, 'futu' plus the Futu SDK's own 'FTFileLog'/'FTConsoleLog'
 (propagate=False, own file + console handlers), 'uvicorn', 'uvicorn.error', 'uvicorn.access'.
 """
-import logging, os, re, sys
+import functools, logging, os, re, sys
 
 FORMAT='%(asctime)s %(levelname)s %(name)s %(message)s'
 COVERED_LOGGERS=('', 'app', 'futu', 'FTFileLog', 'FTConsoleLog', 'uvicorn', 'uvicorn.error', 'uvicorn.access')
@@ -33,6 +33,7 @@ def _spans(t):
     for i in range(len(t)):
         for j in range(i+1,min(len(t),i+3)+1): yield i,j,''.join(t[i:j])
 
+@functools.lru_cache(maxsize=4096)
 def sensitive_name(name):
     t=_tokens(name)
     if not t: return False
@@ -49,16 +50,27 @@ def sensitive_name(name):
 # (e.g. cut by truncation), so no tail of a quoted secret is left visible.
 _VALUE=r"""(?:'(?:[^'\\]|\\.)*(?:'|\\?\Z)|"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[^\s,;&)}\]'"=]{1,256})"""
 _VALUE_RUN=re.compile(r"""[^\s,;&)}\]'"=]*""")   # rest of an unquoted value longer than the 256 bound
-# Names are bounded and may not start right after another name character (incl. '.'), so the
-# scan is linear: no restart after every '.' or '-' of a long token (was quadratic on long lines).
-_NAME=r'(?<![\w.-])[A-Za-z_][\w.-]{0,63}(?![\w.-])'
+# Names may not start right after another name character (incl. '.'), so the scan is linear:
+# no restart after every '.' or '-' of a long token (was quadratic on long lines).
+# Names are unbounded (possessive: no backtracking) but only their LAST 64 chars are classified
+# (NAME_TAIL), so 'very.long.dotted.path...PASSWORD' is still caught and the scan stays linear.
+# Fast pre-check inside the regex engine: a name is only a candidate if, ignoring _ . -
+# separators, it contains one of these words (a superset of what sensitive_name() can accept), so
+# the thousands of harmless 'a=' / 'a:' pairs in a big record never reach Python code.
+_SENS_WORDS=('pass','pw','otp','auth','token','secret','cookie','key','cred','acc','sess','sid','user')
+_SENS_ANY='(?i:'+'|'.join('[_.-]*'.join(w) for w in _SENS_WORDS)+')'
+_NAME=r'(?<![\w.-])(?=[\w.-]*?'+_SENS_ANY+r')[A-Za-z_][\w.-]*+'
+NAME_TAIL=64
 MAX_LINE=8192    # longer lines are truncated (tail dropped) BEFORE redaction
+MAX_TOTAL=65536  # whole-record cap: the tail beyond it is dropped BEFORE redaction
+def _maybe_sensitive(name):
+    return sensitive_name(name[-NAME_TAIL:])
 _AUTH_SCHEME=r"(?:(bearer|basic|token|digest|negotiate|ntlm|hmac[\w-]*)\s+)?"
 # quoted repr ('Authorization': 'Digest ...'): mask up to the closing quote
 _AUTH_Q=re.compile(r"""(?i)(['"](?:proxy-)?authorization['"]\s*[:=]\s*(['"]))"""+_AUTH_SCHEME+r"""(?:(?!\2).)+""")
 # header style (Authorization: Digest username="x", response="y"): mask the rest of the line
 _AUTH=re.compile(r"""(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)"""+_AUTH_SCHEME+r"""[^\r\n]+""")
-_KV=re.compile(r"""(?<![\w.-])(['"]?)((?<![\w.-])[A-Za-z_][\w.-]{0,63}(?![\w.-]))\1(\s*(?:=>|[:=])\s*)("""+_VALUE+')')
+_KV=re.compile(r"""(?<![\w.-])(['"]?)("""+_NAME+r""")\1(\s*(?:=>|[:=])\s*)("""+_VALUE+')')
 _EQ=re.compile(r"""("""+_NAME+r""")=([^&\s,;)'"}\]]+)""")  # also inside quoted strings (URLs)
 _SPACED=re.compile(r"""(?i)\b(password|passwd|pwd|pw|token|secret)(\s+)(?!=|:)([^\s,;'"]+)""")
 _ACCOUNT_NUM=re.compile(r"""(?i)\b(acc(?:ount)?|acct)((?:[_-]?(?:id|no|number))?['"]?[\s:=#'"]*)(\d{4,})""")
@@ -73,7 +85,7 @@ def _kv_scan(text):
         m=_KV.search(text,pos)
         if not m: out.append(text[pos:]); return ''.join(out)
         q,name,sep,val=m.groups()
-        if sensitive_name(name) and not val.strip('\'"').startswith(MASK):
+        if not val.strip('\'"').startswith(MASK) and _maybe_sensitive(name):
             masked=f'{val[0]}{MASK}{val[0]}' if val[:1] in '\'"' else MASK
             end=m.end() if val[:1] in '\'"' else _VALUE_RUN.match(text,m.end()).end()
             out.append(text[pos:m.start()]+f'{q}{name}{q}{sep}{masked}'); pos=end
@@ -81,10 +93,17 @@ def _kv_scan(text):
             out.append(text[pos:m.end(2)]); pos=m.end(2)
 
 def redact(text):
-    """Mask secrets. Over-long lines (rare): each line is handled on its own, the head of a long
-    line is kept, redacted, and only then followed by a visible '...[truncated N chars]' marker, so
-    a value cut at the boundary (quoted or not) is masked to the end of the kept head."""
-    text=str(text)
+    """Mask secrets. Order is TRUNCATE THEN REDACT: a record longer than MAX_TOTAL keeps only its
+    head and an over-long line (rare) keeps only its first MAX_LINE chars; the dropped tails are
+    never emitted, so they cannot leak. The kept text is redacted and a visible
+    '...[truncated N chars]' marker appended. A value cut at a boundary (quoted or not) is masked
+    to the end of the kept head."""
+    text=str(text); cut=''
+    if len(text)>MAX_TOTAL:
+        cut=f'...[truncated {len(text)-MAX_TOTAL} chars]'; text=text[:MAX_TOTAL]
+    return _redact_lines(text)+cut
+
+def _redact_lines(text):
     if len(text)>MAX_LINE and any(len(l)>MAX_LINE for l in text.split('\n')):
         return '\n'.join(_redact(l) if len(l)<=MAX_LINE else _redact(l[:MAX_LINE])+f'...[truncated {len(l)-MAX_LINE} chars]'
                          for l in text.split('\n'))
@@ -94,7 +113,7 @@ def _redact(text):
     text=_AUTH_Q.sub(lambda m: m.group(1)+(m.group(3)+' ' if m.group(3) else '')+MASK,text)
     text=_AUTH.sub(lambda m: m.group(0) if m.group(0).rstrip().endswith(MASK+"'") or m.group(0).rstrip().endswith(MASK+'"') else m.group(1)+(m.group(2)+' ' if m.group(2) else '')+MASK,text)
     text=_URL_CREDS.sub(r'\1***:***@',text)
-    text=_EQ.sub(lambda m: m.group(1)+'='+MASK if sensitive_name(m.group(1)) and m.group(2)!=MASK else m.group(0),text)
+    text=_EQ.sub(lambda m: m.group(1)+'='+MASK if _maybe_sensitive(m.group(1)) and m.group(2)!=MASK else m.group(0),text)
     text=_kv_scan(text)
     text=_SPACED.sub(lambda m: m.group(0) if m.group(3).startswith(MASK) else m.group(1)+m.group(2)+MASK,text)
     text=_ACCOUNT_NUM.sub(r'\1\2'+MASK,text)
