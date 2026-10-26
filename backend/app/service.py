@@ -1,10 +1,11 @@
 import json, uuid
 from datetime import datetime, timedelta
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from .db import *
 from .models import Config, Snapshot
 from .engine import compute, BASES
-from .statistics import analyze, holm
+from collections import Counter
+from .statistics import analyze, explain, holm
 
 def config_for(db,monitor): return db.get(RunConfig,monitor.config_id)
 def create_monitor(db,config):
@@ -49,12 +50,12 @@ def save_snapshot(db,s,config_id=None):
     db.commit(); return result
 
 STREAM_KEYS=('tradingDay','expiration','feedType','source','historical')
-STAT_KEYS=('valuationAt','strictEligible','dBps')+STREAM_KEYS
+STAT_KEYS=('id','valuationAt','strictEligible','dBps')+STREAM_KEYS
 def stat_query(mid,cid,mode,limit=3000):
     # Only the fields statistics need, via SQLite json_extract (avoids decoding ~55KB payloads per row).
     j=lambda path: func.json_extract(AggregateResult.payload,path)
     m=mode.replace('"','')
-    cols=[j('$.valuationAt'),j(f'$.modes."{m}".strictEligible'),j(f'$.modes."{m}".dBps')]+[j(f'$.{k}') for k in STREAM_KEYS]
+    cols=[AggregateResult.id,j('$.valuationAt'),j(f'$.modes."{m}".strictEligible'),j(f'$.modes."{m}".dBps')]+[j(f'$.{k}') for k in STREAM_KEYS]
     return select(*cols).where(AggregateResult.monitor_id==mid,AggregateResult.config_id==cid).order_by(AggregateResult.id.desc()).limit(limit)
 
 def statistics_for(db,m,asof,mode=None):
@@ -64,16 +65,30 @@ def statistics_for(db,m,asof,mode=None):
     # One source/feed, expiry, trade day and historical designation per stream.
     latest=rows[0] if rows else None
     if latest: latest['historical']=bool(latest['historical'])
-    observations=[]
+    observations=[]; ids=[]
     for r in reversed(rows):
         if r['historical'] is not None: r['historical']=bool(r['historical'])
         if latest and any(r.get(k)!=latest.get(k) for k in STREAM_KEYS): continue
-        observations.append({'at':r['valuationAt'],'eligible':bool(r['strictEligible']),'dBps':r['dBps']})
+        observations.append({'at':r['valuationAt'],'eligible':bool(r['strictEligible']),'dBps':r['dBps']}); ids.append(r['id'])
     stat=analyze(observations,asof,cfg)
+    blocks={datetime.fromisoformat(b['at']):b for b in stat['blocks']}
+    stat.update(explain(observations,blocks,stat,asof,cfg,lambda window:reason_counts(db,[ids[i] for i in window],cfg.optionPricePreset)))
     stat.update(configId=rc.id,configHash=rc.hash,configVersion=rc.version,monitorId=m.id,mode=cfg.optionPricePreset,
                 feedType=latest['feedType'] if latest else None,historical=latest['historical'] if latest else False,
                 family=cfg.family,primary=mode is None or mode==rc.payload['optionPricePreset'])
     return stat
+
+def reason_counts(db,ids,mode):
+    """Most common stored ineligibility reasons for the given aggregate rows (SQL json_each, no payload decoding)."""
+    m=mode.replace('"','').replace("'",'')
+    if not ids: return Counter(),Counter()
+    marks=','.join(str(int(i)) for i in ids)
+    reasons=db.execute(text(f"""select r.value,count(*) from aggregate_results a,
+        json_each(json_extract(a.payload,'$.modes."{m}".rows')) row, json_each(json_extract(row.value,'$.reasons')) r
+        where a.id in ({marks}) group by r.value""")).all()
+    statuses=db.execute(text(f"""select json_extract(payload,'$.status'),count(*) from aggregate_results
+        where id in ({marks}) and json_extract(payload,'$.status')!='OK' group by 1""")).all()
+    return Counter(dict(reasons)),Counter(dict(statuses))
 
 def persist_statistics(db,asof):
     groups={}; results=[]
