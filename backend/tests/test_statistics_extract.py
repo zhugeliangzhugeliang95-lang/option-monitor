@@ -23,9 +23,11 @@ def legacy_statistics_for(db,m,asof,mode=None):
                 family=cfg.family,primary=mode is None or mode==rc.payload['optionPricePreset'])
     return stat
 
+NEW_KEYS={'reason','lastGapAt','consecutiveMinutes','neededMinutes','minSlotsPerMinute'}
 def same(a,b):
-    assert a.keys()==b.keys()
-    for k in a:
+    # New diagnostic fields are additive; every legacy field must still match exactly.
+    assert a.keys()==b.keys()|NEW_KEYS
+    for k in b:
         assert a[k]==b[k] and type(a[k])==type(b[k]), k
 
 def test_extract_matches_legacy_field_by_field(cfg,sample,at):
