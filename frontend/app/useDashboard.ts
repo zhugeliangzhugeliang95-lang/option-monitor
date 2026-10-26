@@ -1,5 +1,5 @@
 import { useCallback,useEffect,useState,useRef } from 'react';
-import { type Obj,type Statistics,focusRank,api,rowDefaults,NEW_MONITOR_STRIKES,normStrikes,SYMBOL_RE,ZONE_KEY,browserZone,formatTime } from './lib';
+import { type Obj,type Statistics,focusRank,api,rowDefaults,NEW_MONITOR_STRIKES,normStrikes,SYMBOL_RE,PRINTABLE_ASCII_RE,ZONE_KEY,browserZone,formatTime } from './lib';
 const nyToday=()=>new Date().toLocaleDateString('en-CA',{timeZone:'America/New_York'});
 const defaultPricingAt=()=>new Date(Date.now()+2*86400000).toISOString();
 export function useDashboard(){
@@ -16,11 +16,14 @@ export function useDashboard(){
  const setZone=(z:string)=>{setZoneState(z);try{localStorage.setItem(ZONE_KEY,z);}catch{}};
  // 人工报价默认值：记录最近一次自动填入的值；只刷新仍等于自动默认值（用户未改动）的字段，用户改过的保留
  const manualDefaults=useRef<{inputAt:string,pricingAt:string,expiry:string}>(initialTimes);
- const refreshManualDefaults=useCallback(()=>{const d=manualDefaults.current,next={...d};
-  setInputAt(v=>{if(v!==d.inputAt)return v;next.inputAt=new Date().toISOString();return next.inputAt;});
-  setPricingAt(v=>{if(v!==d.pricingAt)return v;next.pricingAt=defaultPricingAt();return next.pricingAt;});
-  setExpiry(v=>{if(v!==d.expiry)return v;next.expiry=nyToday();return next.expiry;});
-  manualDefaults.current=next;},[]);
+ // 最近一次渲染时的当前值（只读快照），供 refreshManualDefaults 在 updater 之外先算出新值
+ const manualValues=useRef({inputAt,pricingAt,expiry});manualValues.current={inputAt,pricingAt,expiry};
+ const refreshManualDefaults=useCallback(()=>{const d=manualDefaults.current,cur=manualValues.current;
+  const next={inputAt:cur.inputAt===d.inputAt?new Date().toISOString():d.inputAt,pricingAt:cur.pricingAt===d.pricingAt?defaultPricingAt():d.pricingAt,expiry:cur.expiry===d.expiry?nyToday():d.expiry};
+  manualDefaults.current=next;
+  if(cur.inputAt===d.inputAt)setInputAt(next.inputAt);
+  if(cur.pricingAt===d.pricingAt)setPricingAt(next.pricingAt);
+  if(cur.expiry===d.expiry)setExpiry(next.expiry);},[]);
  // 只在切换监测对象（selected 变化）时整体重置为默认值，切 tab 不重置
  const lastSelected=useRef('');
  useEffect(()=>{if(lastSelected.current&&lastSelected.current!==selected){const d={inputAt:new Date().toISOString(),pricingAt:defaultPricingAt(),expiry:nyToday()};manualDefaults.current=d;setInputAt(d.inputAt);setPricingAt(d.pricingAt);setExpiry(d.expiry);}lastSelected.current=selected;},[selected]);
@@ -40,7 +43,7 @@ export function useDashboard(){
  useEffect(()=>{if(current){setConfig(current.config);setViewMode(current.config.optionPricePreset);setPreview(null);}},[current?.id,current?.version]);
  async function run(fn:()=>Promise<any>){setBusy(true);setError('');setNotice('');try{await fn();await load();await details();}catch(e){setError(String(e));}finally{setBusy(false);}}
  useEffect(()=>{if(showCreate){setCreateError('');setNotice('');setError('');setNewBelow(String(NEW_MONITOR_STRIKES));setNewAbove(String(NEW_MONITOR_STRIKES));}},[showCreate]);
- async function create(){const nBelow=normStrikes(newBelow),nAbove=normStrikes(newAbove);setNewBelow(String(nBelow));setNewAbove(String(nAbove));const symbol=newSymbol.trim().toUpperCase();setNewSymbol(symbol);setCreateError('');if(!SYMBOL_RE.test(symbol)){setCreateError('标的代码格式无效：只允许字母、数字和 . - _，以字母或数字开头，最长 20 个字符，例如 SPY、BRK.B。');return;}setBusy(true);setNotice('');setError('');try{const c=await api('/monitors',{symbol,underlyingId:symbol,provider:newProvider,dataMode:{manual:'MANUAL',mock:'MOCK',http:'API',futu:'API'}[newProvider],nBelow,nAbove});setSelected(c.id);setShowCreate(false);setCreateError('');setTab('settings');setNotice(`已创建，选档为现价以下 ${nBelow} 档、以上 ${nAbove} 档。请确认真实到期日。`);await load();}catch(e){setCreateError(e instanceof Error?e.message:String(e));}finally{setBusy(false);}}
+ async function create(){const nBelow=normStrikes(newBelow),nAbove=normStrikes(newAbove);setNewBelow(String(nBelow));setNewAbove(String(nAbove));setCreateError('');if(!PRINTABLE_ASCII_RE.test(newSymbol)){setCreateError('标的代码格式无效：只能使用半角英文字母、数字和 . - _（不支持全角或其他非 ASCII 字符），例如 SPY、BRK.B。');return;}const symbol=newSymbol.trim().toUpperCase();setNewSymbol(symbol);if(!SYMBOL_RE.test(symbol)){setCreateError('标的代码格式无效：只允许字母、数字和 . - _，以字母或数字开头，最长 20 个字符，例如 SPY、BRK.B。');return;}setBusy(true);setNotice('');setError('');try{const c=await api('/monitors',{symbol,underlyingId:symbol,provider:newProvider,dataMode:{manual:'MANUAL',mock:'MOCK',http:'API',futu:'API'}[newProvider],nBelow,nAbove});setSelected(c.id);setShowCreate(false);setCreateError('');setTab('settings');setNotice(`已创建，选档为现价以下 ${nBelow} 档、以上 ${nAbove} 档。请确认真实到期日。`);await load();}catch(e){setCreateError(e instanceof Error?e.message:String(e));}finally{setBusy(false);}}
  async function switchMode(mode:string){setViewMode(mode);setPreview(null);if(latest[selected]){setBusy(true);try{const p=await api(`/monitors/${selected}/preview-price-basis`,{snapshotId:latest[selected].snapshotId,optionPricePreset:mode});setPreview(p);const s=await api(`/monitors/${selected}/statistics?mode=${mode}`);setStats(s);}catch(e){setError(String(e));}finally{setBusy(false);}}}
  async function saveConfig(batch=false){await run(async()=>{const targets=batch?monitors:[current!];for(const m of targets)await api(`/monitors/${m.id}`,batch?{optionPricePreset:viewMode,callPriceBasis:config.callPriceBasis,putPriceBasis:config.putPriceBasis,stockReferenceBasis:config.stockReferenceBasis}:config,'PATCH');setPreview(null);setNotice(batch?'已明确批量应用报价口径；每个监测对象开启新配置版本。':'配置已保存；变更会开启新版本，不混用旧样本。');});}
  const val=(s:any)=>s===''||s==null?null:Number(s);
