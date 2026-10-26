@@ -102,6 +102,8 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 
 单一SQLAlchemy ORM管理SQLite。WAL、busy_timeout=15000ms。RunConfig/RawSnapshot/PairResult/AggregateResult/MinuteBlock/StatisticalResult/FrozenObservation/ObservationOutcome有禁止UPDATE/DELETE触发器。Monitor、WorkerState属于可变控制状态，ProviderStatus和Outbox追加。
 
+所有连接（`db.pragmas` 连接监听器，以及 `retention.run_on_path` 自己的 sqlite3 连接）都设置 `PRAGMA journal_size_limit=67108864`（64 MB）。原因：WAL 文件在 checkpoint 后不会自动缩小，其大小由历史上最大的一次事务决定；实测一次保留清理批次（删除 2000 行）就把 WAL 从约 4.2 MB（默认 1000 页自动 checkpoint）撑到 18.4 MB 并一直保持。设置上限后，每次 checkpoint 完成、WAL 重置时会被截断到上限以内。64 MB 远高于正常约 4 MB 的水位，不影响日常写入，但能防止一次异常大事务后磁盘被长期占用。如需立即回收，仍按 `retention.py` 文档在停机后手动执行 `PRAGMA wal_checkpoint(TRUNCATE)`。
+
 分钟块按统计批次保存不可变修订快照；同一个分钟可出现在多次统计批次中，其statsAsOf可区分，不能将这些审计修订当额外样本。worker在保存结果的同一事务写outbox，API负责广播。worker文件锁与数据库路径绑定，第二个worker启动会拒绝。
 
 ## Futu 用户可见状态（前端契约）
