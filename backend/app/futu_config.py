@@ -22,6 +22,8 @@ HEADROOM_DEFAULTS = {
 }
 CHAIN_LIMIT = 8          # internal per-method window limit (futu.py call())
 WINDOW_BATCHES = 4       # batch starts per 30.1 s window at P = 10.0 s
+MAX_FRESH_TTL = 1800 + 600   # base chain TTL + max stagger
+PREWARM_MIN, PREWARM_MAX = (8, 15), (9, 25)
 
 
 @dataclass
@@ -35,6 +37,10 @@ class FutuSettings:
     chain_warm_max_seconds: float = 600.0
     maint_alert_seconds: float = 300.0
     watchdog: int = 0
+    swr: int = 1                       # (c) serve chains past their fresh TTL (flagged) while refreshing
+    max_age: float = 5400.0            # (c) SWR cap for today's 0DTE chain, seconds since fetchedAt
+    max_age_future: float = 345600.0   # (b5) SWR cap for X > D chains (4 days)
+    prewarm_start: tuple = (9, 0)      # (F) NY HH:MM, start of the chain warm window on trading days
     headroom: dict = field(default_factory=lambda: {k: v for k, (_, v) in HEADROOM_DEFAULTS.items()})
 
     def room(self, method):
@@ -96,6 +102,30 @@ def load(env=None) -> FutuSettings:
         # Phase 2 (section G) is not implemented: only status escalation (E.1) exists.
         log.warning('futu config FUTU_WATCHDOG=%r not supported (phase 2), using 0', raw)
     s.watchdog = 0
+    raw = env.get('FUTU_CHAIN_SWR')
+    if raw in (None, ''):
+        s.swr = d.swr
+    elif raw in ('0', '1'):
+        s.swr = int(raw)
+    else:
+        log.warning('futu config FUTU_CHAIN_SWR=%r invalid, using default %s', raw, d.swr)
+        s.swr = d.swr
+    s.max_age = _num(env, 'FUTU_CHAIN_MAX_AGE', d.max_age)
+    if s.max_age <= MAX_FRESH_TTL:
+        log.warning('futu config FUTU_CHAIN_MAX_AGE=%s not above the max fresh TTL %s, using default %s', s.max_age, MAX_FRESH_TTL, d.max_age)
+        s.max_age = d.max_age
+    s.max_age_future = _num(env, 'FUTU_CHAIN_MAX_AGE_FUTURE', d.max_age_future, lo=MAX_FRESH_TTL + 1)
+    raw = env.get('FUTU_PREWARM_START')
+    s.prewarm_start = d.prewarm_start
+    if raw not in (None, ''):
+        try:
+            hh, mm = raw.split(':')
+            value = (int(hh), int(mm))
+            if len(hh) != 2 or len(mm) != 2 or not (0 <= value[1] < 60) or not (PREWARM_MIN <= value <= PREWARM_MAX):
+                raise ValueError
+            s.prewarm_start = value
+        except ValueError:
+            log.warning('futu config FUTU_PREWARM_START=%r invalid (HH:MM within 08:15-09:25 New York), using default 09:00', raw)
     raw = env.get('FUTU_CHAIN_WARM_PER_CYCLE')
     try:
         warm = int(raw) if raw not in (None, '') else d.warm_per_cycle
@@ -116,7 +146,9 @@ def load(env=None) -> FutuSettings:
 def settings() -> FutuSettings:
     s = load()
     log.info('futu config effective: hot_budget=%s batch_timeout=%s warm_per_cycle=%s (bound %s) close_wait=%s '
-             'hang_seconds=%s busy_alert_cycles=%s chain_warm_max_seconds=%s maint_alert_seconds=%s watchdog=%s headroom=%s',
+             'hang_seconds=%s busy_alert_cycles=%s chain_warm_max_seconds=%s maint_alert_seconds=%s watchdog=%s headroom=%s '
+             'swr=%s max_age=%s max_age_future=%s prewarm_start=%02d:%02d',
              s.hot_budget, s.batch_timeout, s.warm_per_cycle, s.warm_bound(), s.close_wait, s.hang_seconds,
-             s.busy_alert_cycles, s.chain_warm_max_seconds, s.maint_alert_seconds, s.watchdog, s.headroom)
+             s.busy_alert_cycles, s.chain_warm_max_seconds, s.maint_alert_seconds, s.watchdog, s.headroom,
+             s.swr, s.max_age, s.max_age_future, *s.prewarm_start)
     return s

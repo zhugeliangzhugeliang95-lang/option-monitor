@@ -1,4 +1,4 @@
-"""Plan item 1 (PR 1): cooperative deadline, hot-first, warm queue, stagger, refresh-ahead, E.2.
+"""Plan item 1 (PR 1/2): cooperative deadline, hot-first, warm queue, stagger, SWR refresh, E.2.
 
 Everything runs on an injected monotonic clock: the fake OpenD advances it by per-method
 'sleeps' instead of sleeping, so budgets and windows are exact and tests are fast.
@@ -7,7 +7,7 @@ import logging
 import pandas as pd
 import pytest
 from datetime import datetime, timezone
-from app.futu import FutuProvider, DeadlineReached, stagger, CHAIN_TTL, STAGGER, REFRESH_LEAD
+from app.futu import FutuProvider, DeadlineReached, stagger, CHAIN_TTL, STAGGER
 from app.futu_config import FutuSettings, load, HEADROOM_DEFAULTS
 from app.instruments import FUTU_SYMBOLS
 from app.models import Config, Snapshot
@@ -219,8 +219,8 @@ async def test_5_chain_ttl_staggered_per_symbol():
 
 
 @pytest.mark.asyncio
-async def test_5_refresh_ahead_keeps_quoting_through_ttl_no_warming_gap():
-    """PR 1 deviation: refresh-ahead (class 2) instead of SWR; nothing stale is ever served."""
+async def test_5_swr_keeps_quoting_through_ttl_no_warming_gap():
+    """PR 2: past the TTL the chain is served stale (flagged in chain_meta) and refreshed once (class 2)."""
     p, ctx, mono = provider()
     try:
         await batches(p, configs(['SPY']), 3)
@@ -230,7 +230,8 @@ async def test_5_refresh_ahead_keeps_quoting_through_ttl_no_warming_gap():
         chain = p.chains[('US.SPY', EXPIRY)]
         assert chain['fetched'] > first and mono.t < chain['expires']
         refreshed_at = chain['fetched'] - first
-        assert CHAIN_TTL + stagger('US.SPY') - REFRESH_LEAD <= refreshed_at <= CHAIN_TTL + stagger('US.SPY') - REFRESH_LEAD + 10
+        assert CHAIN_TTL + stagger('US.SPY') <= refreshed_at <= CHAIN_TTL + stagger('US.SPY') + 10
+        assert all(not any(e.code == 'CHAIN_WARMING' for e in errors.values()) for _, _, _, errors in runs)
     finally:
         await p.close()
 

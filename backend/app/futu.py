@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import math
 import os
@@ -11,6 +11,7 @@ import socket
 import logging
 import time
 import zlib
+import exchange_calendars as xcals
 from zoneinfo import ZoneInfo
 
 from .models import Capabilities, Config, Contract, MarketState, Quote, Snapshot, Leg, utcnow
@@ -26,7 +27,10 @@ SOURCE = 'Futu OpenD / US snapshots'
 WINDOW = 30.1            # seconds, internal limiter window
 CHAIN_TTL = 1800         # base fresh TTL for chains and expirations
 STAGGER = 600            # per-symbol TTL offset range [0, 600)
-REFRESH_LEAD = 300       # refresh a fresh chain this long before its TTL ends (no stale serving in PR 1)
+REFRESH_LEAD = 300       # refresh an expiration list this long before its TTL ends
+WINDOW_AFTER_CLOSE = 15  # minutes: chain warm window ends at session close + 15 min (b6)
+PREWARM_CHECK_MIN = 25   # minutes after PREWARM_START: the 09:25 pre-warm report (F)
+OFFLINE_LOG_EVERY = 60   # seconds between OPEND_OFFLINE warnings (F)
 PREFETCH_PER_BATCH = 3   # expiration prefetches per batch
 
 
@@ -125,10 +129,17 @@ class FutuProvider:
         self.unresponsive_since = None
         self.next_error_at = 0.0
         # Chain warm cache (section A): key (code, expiry)
-        self.chains = {}       # key -> {'contracts', 'fetched', 'expires'}
-        self.dates = {}        # code -> {'dates', 'fetched', 'expires'}
+        self.chains = {}       # key -> {'contracts', 'fetched', 'fetchedAt', 'fetchedDay', 'expires'}
+        self.dates = {}        # code -> {'dates', 'fetched', 'fetchedDay', 'expires'}
         self.warm = {}         # key -> WarmState
-        self.refresh_next = {} # key -> monotonic time of next refresh-ahead attempt
+        self.refresh = {}      # key -> {'failures', 'next'}: one pending SWR refresh per key (c)
+        self.dropped = {}      # key -> 'MAX_AGE' until re-warmed (class-1 priority)
+        self.chain_meta = {}   # monitor id -> chain metadata of the last batch (stale / expirationsStale)
+        self.windows = {}      # (calendar, tz, day, start) -> warm window or None
+        self.day = None        # last NY day seen by the batch path (b10 sweep)
+        self.prewarm_checked = set()
+        self.offline = False
+        self.offline_logged = float('-inf')
 
     async def run(self, fn, *args):
         async with self.lock:
@@ -341,54 +352,159 @@ class FutuProvider:
             out[c.id] = quote_from_row(row)
         return out
 
-    # ---- batch path: hot first, then warm with what is left (sections A, E.2) ----
+    # ---- batch path: hot first, then warm with what is left (sections A, E.2, b, c, F) ----
     def batch_snapshots(self, configs):
-        """Quotes for monitors whose chain is cached, then warm at most WARM_PER_CYCLE chains.
+        """Quotes for monitors whose chain is servable, then warm/refresh at most WARM_PER_CYCLE chains.
 
-        Each monitor keeps its own errors; no expiry or strike substitution. A monitor whose
-        chain is not cached gets CHAIN_WARMING (or CHAIN_UNAVAILABLE after the E.2 cap) and
-        its first quote in the next batch. Nothing stale is served in this path.
+        Each monitor keeps its own errors; no expiry or strike substitution. A chain past its fresh
+        TTL is served stale-while-revalidate (c), flagged in `self.chain_meta` (never in the
+        Snapshot), up to the max age, and never across the NY day roll (b3). A monitor with nothing
+        servable gets CHAIN_WARMING (reason queued/retrying/offHours) or CHAIN_UNAVAILABLE (E.2).
         """
         self.deadline = self.mono() + self.settings.hot_budget
+        self.chain_meta = {}
         try:
             return self._batch(configs)
         finally:
             self.deadline = None
 
-    def _catalog(self, code, expiry, day, now):
-        if expiry < day:
-            return []  # expired: never replaced -> engine status EXPIRED, no OpenD call
-        chain = self.chains.get((code, expiry))
-        if chain and chain['expires'] > now:
-            return chain['contracts']
-        dates = self.dates.get(code)
-        if dates and dates['expires'] > now and expiry not in live_expirations(dates['dates'], day):
-            return []  # not listed -> NO_SAME_DAY_EXPIRY / EXPIRED from the engine
-        return None
+    def _window(self, cfg, wall):
+        """(start, end) of the chain warm window for the NY day of `wall`, or None on a non-trading day.
 
-    def _batch(self, configs):
+        Window = [FUTU_PREWARM_START, session close + 15 min] (b6); the close comes from the
+        exchange calendar, so early closes end it early (b8)."""
+        day = exchange_day(cfg, wall)
+        key = (cfg.calendar, cfg.exchangeTimezone, day, self.settings.prewarm_start)
+        if key not in self.windows:
+            window = None
+            try:
+                cal = xcals.get_calendar(cfg.calendar)
+                if cal.is_session(day):
+                    h, m = self.settings.prewarm_start
+                    begin = datetime.fromisoformat(day).replace(hour=h, minute=m, tzinfo=ZoneInfo(cfg.exchangeTimezone))
+                    close = cal.session_close(day).to_pydatetime().astimezone(timezone.utc)
+                    window = (begin.astimezone(timezone.utc), close + timedelta(minutes=WINDOW_AFTER_CLOSE))
+            except Exception:  # unknown calendar / date outside its range: no window, no chain warming
+                window = None
+            if len(self.windows) > 64:
+                self.windows.clear()
+            self.windows[key] = window
+        return self.windows[key]
+
+    def in_window(self, cfg, wall):
+        w = self._window(cfg, wall)
+        return w is not None and w[0] <= wall <= w[1]
+
+    def _roll(self, wall):
+        """(b10) Eager sweep on the first batch of a new NY day. Lookups enforce the rules anyway."""
+        day = exchange_day(Config(), wall)
+        if day == self.day:
+            return
+        self.day = day
+        prev = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+        gone = {k for k, c in self.chains.items() if k[1] < day or (k[1] == day and c['fetchedDay'] < day)}
+        for k in gone:
+            del self.chains[k]
+        old_dates = [code for code, d in self.dates.items() if d['fetchedDay'] < prev]
+        for code in old_dates:
+            del self.dates[code]
+        for store in (self.warm, self.refresh, self.dropped):
+            for k in [k for k in store if k[1] < day or k in gone]:
+                del store[k]
+        if gone or old_dates:
+            log.info('futu day roll %s: swept %d chains, %d expiration lists', day, len(gone), len(old_dates))
+
+    def _dates_state(self, code, day, now):
+        """'fresh' (today, within TTL), 'stale' (today past TTL, or yesterday: usable only through
+        live_expirations, rule b1) or None (missing / older than one NY day)."""
+        d = self.dates.get(code)
+        if not d:
+            return None
+        if d['fetchedDay'] == day and d['expires'] > now:
+            return 'fresh'
+        prev = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+        return 'stale' if d['fetchedDay'] >= prev else None
+
+    def _meta(self, key, chain, day, wall, stale, now):
+        dstate = self._dates_state(key[0], day, now)
+        e_stale = dstate is not None and self.dates[key[0]]['fetchedDay'] != day
+        if not stale and not e_stale:
+            return None  # fresh chain and today's expirations: payloads stay byte-identical
+        return {'stale': stale, 'ageSeconds': max(0, round((wall - chain['fetchedAt']).total_seconds())),
+                'fetchedAt': chain['fetchedAt'].isoformat(),
+                'refreshFailures': self.refresh.get(key, {}).get('failures', 0),
+                'expirationsStale': e_stale}
+
+    def _catalog(self, code, expiry, day, now, wall):
+        """(catalog, meta) if servable; (None, None) if the key is cold."""
+        if expiry < day:
+            return [], None  # expired: never replaced -> engine status EXPIRED, no OpenD call (b2)
+        key = (code, expiry)
+        chain = self.chains.get(key)
+        if chain is not None and expiry == day and chain['fetchedDay'] != day:
+            del self.chains[key]  # b3: a chain fetched before the roll is never served on D
+            self.refresh.pop(key, None)
+            chain = None
+        if chain is not None:
+            if chain['expires'] > now:
+                return chain['contracts'], self._meta(key, chain, day, wall, False, now)
+            age = (wall - chain['fetchedAt']).total_seconds()
+            cap = self.settings.max_age if expiry == day else self.settings.max_age_future
+            if self.settings.swr and age <= cap:
+                self.refresh.setdefault(key, {'failures': 0, 'next': 0.0})  # exactly one pending refresh
+                return chain['contracts'], self._meta(key, chain, day, wall, True, now)
+            del self.chains[key]
+            self.refresh.pop(key, None)
+            if self.settings.swr:
+                self.dropped[key] = 'MAX_AGE'
+                log.warning('futu chain %s %s dropped at max age (%ds > %ds)', code, expiry, age, cap)
+        dstate = self._dates_state(code, day, now)
+        if dstate and expiry not in live_expirations(self.dates[code]['dates'], day):
+            return [], None  # not listed -> NO_SAME_DAY_EXPIRY / EXPIRED from the engine
+        return None, None
+
+    def _permissions(self):
+        """permissions() with the F offline log rhythm: connect is tried every batch, but the
+        WARNING is logged at most once per 60 s (status code only), plus one INFO on reconnect."""
         try:
             self.permissions()
         except DeadlineReached as d:
             raise timeout_error(d.method) from None
-        wall, now = self.clock(), self.mono()
+        except ProviderError as e:
+            if e.code == 'OPEND_OFFLINE':
+                if self.mono() - self.offline_logged >= OFFLINE_LOG_EVERY:
+                    self.offline_logged = self.mono()
+                    log.warning('futu OpenD offline (OPEND_OFFLINE); retrying every batch')
+                self.offline = True
+            raise
+        if self.offline:
+            self.offline = False
+            self.offline_logged = float('-inf')
+            log.info('futu OpenD reachable again')
+
+    def _batch(self, configs):
+        wall = self.clock()
+        self._roll(wall)
+        self._permissions()
+        now = self.mono()
         catalogs, errors, cold, info = {}, {}, {}, {}
         for mid, cfg in configs.items():
             try:
                 code = code_for(cfg.underlyingId)
                 day = exchange_day(cfg, wall)
                 expiry = target_expiry(cfg, day)
-                catalog = self._catalog(code, expiry, day, now)
+                key = (code, expiry)
+                catalog, meta = self._catalog(code, expiry, day, now, wall)
+                klass = 1 if expiry == day or key in self.dropped else 3
+                info.setdefault(key, (cfg, day, klass))
                 if catalog is not None:
                     catalogs[mid] = catalog
-                    info.setdefault((code, expiry), (cfg, day, 1 if expiry == day else 3))
+                    if meta:
+                        self.chain_meta[mid] = meta
                 else:
-                    cold.setdefault((code, expiry), []).append(mid)
-                    info[(code, expiry)] = (cfg, day, 1 if expiry == day else 3)
+                    cold.setdefault(key, []).append(mid)
             except ProviderError as e:
                 errors[mid] = e
-        for key in [k for k, st in self.warm.items() if k not in cold and k[1] < exchange_day(Config(), wall)]:
-            del self.warm[key]
         for key in cold:
             if key not in self.warm:
                 self.warm[key] = WarmState(wall, now)
@@ -401,13 +517,19 @@ class FutuProvider:
             except DeadlineReached as d:
                 for mid in ready:
                     errors[mid] = timeout_error(d.method)
-        warmed = self._warm(cold, info, catalogs)
+        warmed, off_hours = self._warm(cold, info, wall)
         for key, mids in cold.items():
             st = self.warm[key]
+            if key in off_hours:
+                st.since = wall  # (b6) off-hours waiting never counts toward the E.2 cap
             waited = max(0, round((wall - st.since).total_seconds()))
-            chain = {'state': 'warming', 'reason': 'retrying' if st.last_error else 'queued',
-                     'waitingSeconds': waited, 'attempts': st.attempts, 'lastError': st.last_error}
-            if key not in warmed and st.last_error and waited > self.settings.chain_warm_max_seconds:
+            reason = 'offHours' if key in off_hours else 'retrying' if st.last_error else 'queued'
+            chain = {'state': 'warming', 'reason': reason, 'waitingSeconds': waited,
+                     'attempts': st.attempts, 'lastError': st.last_error}
+            if key in self.dropped:
+                chain['droppedReason'] = self.dropped[key]
+            if (key not in warmed and key not in off_hours and st.last_error
+                    and waited > self.settings.chain_warm_max_seconds):
                 chain['state'] = 'unavailable'
                 error = 'CHAIN_UNAVAILABLE'
                 if not st.warned:
@@ -423,11 +545,31 @@ class FutuProvider:
                 errors[mid] = e
         for key in warmed:
             st = self.warm.pop(key, None)
+            self.dropped.pop(key, None)
             if st is not None and st.attempts:
                 log.info('futu chain %s %s ready after %ds, %d attempts', key[0], key[1],
                          (wall - st.since).total_seconds(), st.attempts + 1)
+        self._prewarm_check(info, cold, warmed, wall)
         return snapshots, errors
 
+    def _prewarm_check(self, info, cold, warmed, wall):
+        """(F) Once per trading day, between PREWARM_START+25 min and +35 min: report today's chains."""
+        today = [(k, v) for k, v in info.items() if k[1] == v[1]]
+        if not today:
+            return
+        cfg, day, _ = today[0][1]
+        w = self._window(cfg, wall)
+        if w is None or day in self.prewarm_checked:
+            return
+        check = w[0] + timedelta(minutes=PREWARM_CHECK_MIN)
+        if not (check <= wall < check + timedelta(minutes=10)):
+            return
+        self.prewarm_checked.add(day)
+        missing = sorted(k[0] for k, _ in today if k in cold and k not in warmed)
+        if missing:
+            log.warning('futu prewarm incomplete %d/%d, cold: %s', len(today) - len(missing), len(today), ','.join(missing))
+        else:
+            log.info('futu prewarm complete %d/%d', len(today), len(today))
     def _hot(self, ready, catalogs):
         errors = {}
         codes = list(dict.fromkeys(code_for(cfg.underlyingId) for cfg in ready.values()))
@@ -463,33 +605,49 @@ class FutuProvider:
         return snapshots, errors
 
     def _dates(self, code, cfg, force=False):
-        """Fresh expirations for a symbol, fetching them if needed (one E call)."""
-        now = self.mono()
-        dates = self.dates.get(code)
-        if dates and dates['expires'] > now and not force:
-            return dates['dates']
+        """Today's fresh expirations for a symbol, fetching them if needed (one E call)."""
+        now, wall = self.mono(), self.clock()
+        if not force and self._dates_state(code, exchange_day(cfg, wall), now) == 'fresh':
+            return self.dates[code]['dates']
         values = self.expirations(cfg, check_permissions=False, ttl=0)
         done = self.mono()
-        self.dates[code] = {'dates': values, 'fetched': done, 'expires': done + CHAIN_TTL}
+        self.dates[code] = {'dates': values, 'fetched': done, 'expires': done + CHAIN_TTL,
+                            'fetchedDay': exchange_day(cfg, self.clock())}
         return values
 
-    def _fail(self, key, error):
-        st = self.warm[key]
-        st.attempts += 1
-        st.last_error = {'code': error.code, 'at': self.clock().isoformat()}
-        if getattr(error, 'vendor_ret', None) is not None:
-            st.last_error['ret'] = error.vendor_ret
-        st.next_try = self.mono() + min(300, 10 * 2 ** (st.attempts - 1))
-        st.waiting = self.mono()  # back of the round-robin queue
+    def _refresh_failed(self, key, error):
+        """(c) A failed SWR refresh keeps serving stale; RATE_LIMITED just stays queued."""
+        r = self.refresh.get(key)
+        if r is None:
+            return
+        if error.code == 'RATE_LIMITED':
+            r['next'] = self.mono() + 10
+            return
+        r['failures'] += 1
+        r['next'] = self.mono() + min(300, 10 * 2 ** (r['failures'] - 1))
+        log.info('futu chain refresh %s %s failed (%s), attempt %d, next in %ds', key[0], key[1], error.code,
+                 r['failures'], min(300, 10 * 2 ** (r['failures'] - 1)))
 
-    def _warm(self, cold, info, catalogs):
-        """Warm/refresh queue: class 1 cold today, class 2 refresh-ahead, class 3 other cold."""
+    def _warm(self, cold, info, wall):
+        """Warm/refresh queue: class 1 cold today (or dropped at max age), class 2 SWR refreshes,
+        class 3 other cold. Chain calls only inside the warm window (b6), except one cold fetch
+        per batch for an X > D key with nothing cached (b5). Returns (warmed, off_hours)."""
         now = self.mono()
-        warm_cold = [k for k in cold if self.warm[k].next_try <= now]
-        refresh = [k for k in info if k not in cold and k in self.chains
-                   and now >= self.chains[k]['expires'] - REFRESH_LEAD and self.refresh_next.get(k, 0) <= now]
+        off_hours, allowed = set(), []
+        off_cold_budget = 1
+        for k in cold:
+            cfg, day, _ = info[k]
+            if self.in_window(cfg, wall):
+                allowed.append(k)
+            elif k[1] > day:
+                allowed.append(k)  # b5: off-hours cold fetch for a far-dated key, counted below
+            else:
+                off_hours.add(k)
+        warm_cold = [k for k in allowed if self.warm[k].next_try <= now]
+        refresh = [k for k in info if k not in cold and k in self.refresh and k in self.chains
+                   and self.refresh[k]['next'] <= now and self.in_window(info[k][0], wall)]
         queue = (sorted([k for k in warm_cold if info[k][2] == 1], key=lambda k: (self.warm[k].waiting, k[0]))
-                 + sorted(refresh, key=lambda k: (self.chains[k]['fetched'], k[0]))
+                 + sorted(refresh, key=lambda k: (self.chains[k]['fetchedAt'], k[0]))
                  + sorted([k for k in warm_cold if info[k][2] == 3], key=lambda k: (self.warm[k].waiting, k[0])))
         warmed, chain_calls, served = set(), 0, set()
         for key in queue:
@@ -497,6 +655,11 @@ class FutuProvider:
                 break
             code, expiry = key
             cfg, day, _ = info[key]
+            off = not self.in_window(cfg, wall)
+            if off:
+                if off_cold_budget <= 0:
+                    continue
+                off_cold_budget -= 1
             served.add(key)
             try:
                 dates = self._dates(code, cfg)
@@ -506,10 +669,11 @@ class FutuProvider:
                     continue
                 chain_calls += 1
                 contracts = self.contracts(cfg, expiry, check_permissions=False, ttl=0)
-                done = self.mono()
-                self.chains[key] = {'contracts': contracts, 'fetched': done,
+                done, at = self.mono(), self.clock()
+                self.chains[key] = {'contracts': contracts, 'fetched': done, 'fetchedAt': at,
+                                    'fetchedDay': exchange_day(cfg, at),
                                     'expires': done + CHAIN_TTL + stagger(code)}
-                self.refresh_next.pop(key, None)
+                self.refresh.pop(key, None)
                 if key in cold:
                     warmed.add(key)
             except DeadlineReached:
@@ -519,28 +683,49 @@ class FutuProvider:
                 if key in cold:
                     self._fail(key, e)
                 else:
-                    self.refresh_next[key] = self.mono() + 10
-                    log.debug('futu chain refresh %s %s failed: %s', code, expiry, e.code)
-        # Prefetch expirations for the next queued cold symbols, then refresh-ahead expirations
-        # that are about to expire (own 50/window limit, at most PREFETCH_PER_BATCH per batch).
+                    self._refresh_failed(key, e)
+        # Prefetch expirations for queued cold symbols (also off-hours: NO_SAME_DAY_EXPIRY / EXPIRED
+        # are still reported, b6 i), then refresh expirations that are about to expire or are from
+        # an earlier NY day (own 50/window limit, at most PREFETCH_PER_BATCH per batch).
         prefetched = 0
-        soon = [k for k in info if k not in cold and k not in self.chains and k[0] in self.dates
-                and self.mono() >= self.dates[k[0]]['expires'] - REFRESH_LEAD]
-        for key in [k for k in queue if k in cold and k not in served] + soon:
+        pending = [k for k in cold if k not in served]
+        pending = sorted(pending, key=lambda k: (info[k][2], self.warm[k].waiting, k[0]))
+        soon = []
+        for k in info:
+            if k in cold or k[0] not in self.dates:
+                continue
+            d = self.dates[k[0]]
+            if d['fetchedDay'] != info[k][1] or self.mono() >= d['expires'] - REFRESH_LEAD:
+                soon.append(k)
+        done_codes = set()
+        for key in pending + soon:
             if prefetched >= PREFETCH_PER_BATCH:
                 break
             code = key[0]
-            if key in cold and self.dates.get(code) and self.dates[code]['expires'] > self.mono():
+            cfg, day, _ = info[key]
+            if code in done_codes:
+                continue
+            if key in cold and self._dates_state(code, day, self.mono()) == 'fresh':
                 continue
             prefetched += 1
+            done_codes.add(code)
             try:
-                self._dates(code, info[key][0], force=key not in cold)
+                self._dates(code, cfg, force=key not in cold)
             except DeadlineReached:
                 break
             except ProviderError as e:
-                if key in cold:
+                if key in cold and key not in off_hours:
                     self._fail(key, e)
-        return warmed
+        return warmed, off_hours
+
+    def _fail(self, key, error):
+        st = self.warm[key]
+        st.attempts += 1
+        st.last_error = {'code': error.code, 'at': self.clock().isoformat()}
+        if getattr(error, 'vendor_ret', None) is not None:
+            st.last_error['ret'] = error.vendor_ret
+        st.next_try = self.mono() + min(300, 10 * 2 ** (st.attempts - 1))
+        st.waiting = self.mono()  # back of the round-robin queue
 
     async def collect_batch(self, configs):
         return await self.run(self.batch_snapshots, configs)

@@ -25,7 +25,7 @@ def fingerprint(s):
         q.pop('receivedAt',None); q.pop('ingestedAt',None)
     return digest(data)
 
-def save_snapshot(db,s,config_id=None):
+def save_snapshot(db,s,config_id=None,extra=None):
     m=db.get(Monitor,s.monitorId)
     if not m or not m.active: raise ValueError('监测对象不存在或已停用')
     rc=db.get(RunConfig,config_id or m.config_id); cfg=Config.model_validate(rc.payload)
@@ -44,6 +44,7 @@ def save_snapshot(db,s,config_id=None):
         if duplicate: a['strictEligible']=False; a['dBps']=None
     raw=record(RawSnapshot,m.id,rc.id,s.model_dump(mode='json'),fingerprint=fp); db.add(raw); db.flush()
     result['snapshotId']=raw.id
+    if extra: result.update(extra)  # e.g. futu chain-stale metadata; kept out of the Snapshot / fingerprint
     # Pair rows live in the aggregate payload (modes[*].rows); pair_results is legacy/read-only now.
     db.add(record(AggregateResult,m.id,rc.id,result,snapshot_id=raw.id))
     db.add(ResultOutbox(payload={'type':'result','monitorId':m.id,'snapshotId':raw.id},created_at=nowstr()))

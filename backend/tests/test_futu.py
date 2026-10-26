@@ -280,6 +280,9 @@ async def test_futu_expirations_drop_expired():
 @pytest.mark.asyncio
 async def test_batch_same_day_uses_today_not_expired():
     ctx=ChainOpenD();p=FutuProvider(ctx,clock=CLOCK24,mono=Mono())
+    # 2026-10-24 is a Saturday: (b7) no chain warming on non-trading days, so pin the warm window
+    # open here; this test is about expiry choice. The weekend rule itself is test 6(vi).
+    p.in_window=lambda cfg,wall: True
     try:
         cfg=Config(provider='futu',dataMode='API',nBelow=1)
         snaps,errors=await warm(p,{'m':cfg})
@@ -292,6 +295,7 @@ async def test_batch_same_day_uses_today_not_expired():
 @pytest.mark.parametrize('fixed,status_expired',[('2026-10-23',True),('2026-10-24',False),('2026-10-26',False)])
 async def test_batch_fixed_expiration_expired_is_reported_not_substituted(fixed,status_expired):
     ctx=ChainOpenD();p=FutuProvider(ctx,clock=CLOCK24,mono=Mono())
+    p.in_window=lambda cfg,wall: True  # Saturday: see test_batch_same_day_uses_today_not_expired
     try:
         cfg=Config(provider='futu',dataMode='API',nBelow=1,expiryMode='manual',expiration=fixed)
         snaps,errors=await warm(p,{'m':cfg})
