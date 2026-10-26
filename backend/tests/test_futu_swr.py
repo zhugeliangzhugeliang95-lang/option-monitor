@@ -288,7 +288,7 @@ async def test_7iii_refresh_failure_backoff_and_info_log(caplog):
         assert waits == [10, 20, 40, 80, 160, 300]
         assert 'futu chain refresh US.SPY 2026-10-23 failed' in caplog.text
         snaps, _ = await run(p, cfg(), step=0)
-        assert 'SPY' in snaps and p.chain_meta['SPY']['refreshFailures'] == 6
+        assert 'SPY' in snaps and p.chain_meta['SPY']['refreshFailures'] == 7  # includes this batch's failure
     finally:
         await p.close()
 
@@ -444,7 +444,7 @@ async def test_14_stale_meta_in_status_and_result_absent_when_fresh():
         ctx.chain_error = '内部错误'
         await tick(w)
         st = last_status(mid)
-        assert st['status'] not in warm and st['chain']['stale'] is True and st['chain']['refreshFailures'] == 0
+        assert st['status'] not in warm and st['chain']['stale'] is True and st['chain']['refreshFailures'] == 1  # this batch's failed refresh
         with Session() as db:
             res = db.scalars(select(AggregateResult).where(AggregateResult.monitor_id == mid).order_by(AggregateResult.id.desc())).first()
         assert res.payload['chain']['stale'] is True

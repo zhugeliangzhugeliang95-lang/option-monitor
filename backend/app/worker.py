@@ -98,7 +98,7 @@ class Worker:
                 for mid,rc in items:
                     await self.collect(mid,rc,pre_error=error)
                 return
-            meta=dict(getattr(self.providers['futu'],'chain_meta',None) or {})  # read right after the batch (one batch at a time)
+            meta=dict(getattr(self.providers['futu'],'chain_meta',None) or {})  # read right after the batch, no await in between; FutuProvider runs one batch at a time
             for mid, rc in items:
                 await self.collect(mid,rc,prepared=snapshots.get(mid),pre_error=errors.get(mid),
                                    chain_meta=meta.get(mid) if snapshots.get(mid) is not None else None)
