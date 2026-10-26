@@ -31,6 +31,7 @@ REFRESH_LEAD = 300       # refresh an expiration list this long before its TTL e
 WINDOW_AFTER_CLOSE = 15  # minutes: chain warm window ends at session close + 15 min (b6)
 PREWARM_CHECK_MIN = 25   # minutes after PREWARM_START: the 09:25 pre-warm report (F)
 OFFLINE_LOG_EVERY = 60   # seconds between OPEND_OFFLINE warnings (F)
+CALENDAR_LOG_EVERY = 3600  # seconds between calendar-error warnings per window key
 PREFETCH_PER_BATCH = 3   # expiration prefetches per batch
 
 
@@ -136,6 +137,8 @@ class FutuProvider:
         self.dropped = {}      # key -> 'MAX_AGE' until re-warmed (class-1 priority)
         self.chain_meta = {}   # monitor id -> chain metadata of the last batch (stale / expirationsStale)
         self.windows = {}      # (calendar, tz, day, start) -> warm window or None
+        self.window_logged = {}  # window key -> monotonic time of the last calendar-error WARNING
+        self.batching = False  # chain_meta is per batch: only one batch may run at a time
         self.day = None        # last NY day seen by the batch path (b10 sweep)
         self.prewarm_checked = set()
         self.offline = False
@@ -361,12 +364,18 @@ class FutuProvider:
         Snapshot), up to the max age, and never across the NY day roll (b3). A monitor with nothing
         servable gets CHAIN_WARMING (reason queued/retrying/offHours) or CHAIN_UNAVAILABLE (E.2).
         """
+        # chain_meta is reset here and read by the worker right after this batch returns, so it relies
+        # on one batch at a time (run() never starts a second executor call while one is pending).
+        if self.batching:
+            raise RuntimeError('concurrent futu batch: chain_meta requires one batch at a time')
+        self.batching = True
         self.deadline = self.mono() + self.settings.hot_budget
         self.chain_meta = {}
         try:
             return self._batch(configs)
         finally:
             self.deadline = None
+            self.batching = False
 
     def _window(self, cfg, wall):
         """(start, end) of the chain warm window for the NY day of `wall`, or None on a non-trading day.
@@ -384,8 +393,13 @@ class FutuProvider:
                     begin = datetime.fromisoformat(day).replace(hour=h, minute=m, tzinfo=ZoneInfo(cfg.exchangeTimezone))
                     close = cal.session_close(day).to_pydatetime().astimezone(timezone.utc)
                     window = (begin.astimezone(timezone.utc), close + timedelta(minutes=WINDOW_AFTER_CLOSE))
-            except Exception:  # unknown calendar / date outside its range: no window, no chain warming
+            except Exception as e:  # unknown calendar / date outside its range: no window, no chain warming
                 window = None
+                # Rate-limited per key; exception class only (never its message), so nothing leaks.
+                if self.mono() - self.window_logged.get(key, float('-inf')) >= CALENDAR_LOG_EVERY:
+                    self.window_logged[key] = self.mono()
+                    log.warning('futu calendar error calendar=%s day=%s error=%s: no warm window, '
+                                'same-day chains report offHours', cfg.calendar, day, type(e).__name__)
             if len(self.windows) > 64:
                 self.windows.clear()
             self.windows[key] = window
@@ -487,7 +501,7 @@ class FutuProvider:
         self._roll(wall)
         self._permissions()
         now = self.mono()
-        catalogs, errors, cold, info = {}, {}, {}, {}
+        catalogs, errors, cold, info, meta_keys = {}, {}, {}, {}, {}
         for mid, cfg in configs.items():
             try:
                 code = code_for(cfg.underlyingId)
@@ -501,6 +515,7 @@ class FutuProvider:
                     catalogs[mid] = catalog
                     if meta:
                         self.chain_meta[mid] = meta
+                        meta_keys[mid] = key
                 else:
                     cold.setdefault(key, []).append(mid)
             except ProviderError as e:
@@ -518,6 +533,10 @@ class FutuProvider:
                 for mid in ready:
                     errors[mid] = timeout_error(d.method)
         warmed, off_hours = self._warm(cold, info, wall)
+        # refreshFailures reflects this batch's refresh attempt (0 once a refresh succeeded); the
+        # served contracts and stale/ageSeconds/fetchedAt still describe what this batch served.
+        for mid, key in meta_keys.items():
+            self.chain_meta[mid]['refreshFailures'] = self.refresh.get(key, {}).get('failures', 0)
         for key, mids in cold.items():
             st = self.warm[key]
             if key in off_hours:

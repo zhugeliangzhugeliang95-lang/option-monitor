@@ -173,7 +173,7 @@ Quote、Contract、Capabilities、MarketState均定义于`app/models.py`。Quote
 | `chain.stale` | bool（链已过新鲜 TTL、按 SWR 出数时为 true） | 总有 |
 | `chain.ageSeconds` | int（距 `fetchedAt` 的秒数） | 总有 |
 | `chain.fetchedAt` | ISO 8601 string（UTC） | 总有 |
-| `chain.refreshFailures` | int（后台刷新连续失败次数） | 总有 |
+| `chain.refreshFailures` | int（后台刷新连续失败次数，含本批次的刷新结果：本批刷新失败则已 +1，本批刷新成功则为 0） | 总有 |
 | `chain.expirationsStale` | bool（到期日列表为前一交易日） | 总有 |
 
 注意：可能出现 `stale=false` 且 `expirationsStale=true`（链新鲜、到期日列表旧）。
