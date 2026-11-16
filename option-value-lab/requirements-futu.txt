@@ -1,0 +1,2 @@
+-r requirements.txt
+futu-api==10.11.7108

@@ -1,3 +1,27 @@
+# 期权研究工具
+
+## 最新独立版 执行价研究室 1.3
+
+当前新版位于 **[option-value-lab](option-value-lab/README.md)**，使用独立环境和端口 3200。
+
+- 真实行权价按「前 3 ＋ 自身 ＋ 后 3」选档，LAST / MID 分别显示中位数、最大值、最小值。
+- 三档 Call 复制参考价、相对溢价及计算明细与附件案例对应。
+- 支持富途 OpenD、人工报价、JSON / CSV 导入及研究文件导出。
+- 包含编辑合约信息保留、期限校验和缺失报价提示；71 项 Python 测试及 10 项前端测试通过。
+
+下载仓库后，在 `option-value-lab` 目录双击 `启动研究室.command`，或运行：
+
+```sh
+cd option-value-lab
+sh start.sh
+```
+
+Windows 在该目录运行 `start.ps1`，或执行 `py -3 scripts/launch.py`。需要 Python 3.12+；首次安装依赖需要网络。行情需要本机 OpenD 登录并具有对应权限。打开 http://127.0.0.1:3200/ 。
+
+[计算说明](option-value-lab/docs/CALCULATIONS.md) · [验收记录](option-value-lab/docs/VALIDATION.md)
+
+以下为原监测台说明，其启动入口和计算口径属于旧应用。
+
 # Parity Lab · 期权反推价格监测台
 
 可运行的本地金融研究工作台。Next.js / React / TypeScript / Tailwind / shadcn 风格 Button + FastAPI / Pydantic / SQLAlchemy / SQLite + 独立 Python worker。所有定价、均值与价差由 Python 计算。没有交易接口。
